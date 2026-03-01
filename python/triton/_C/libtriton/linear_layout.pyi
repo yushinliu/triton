@@ -67,6 +67,12 @@ class LinearLayout:
 
     def get_matrix_view(self) -> List[List[int]]: ...
 
+    def get_2d_matrix_view(
+        self,
+        row_col_dims: Optional[Tuple[str, str]] = None,
+        threads_per_warp: int = 32,
+    ) -> List[List[str]]: ...
+
     def apply(
         self, inputs: Sequence[Tuple[str, int]]
     ) -> List[Tuple[str, int]]: ...

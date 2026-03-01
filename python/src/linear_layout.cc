@@ -219,5 +219,185 @@ void init_linear_layout(py::module &&m) {
           }
         }
         return result;
-      });
+      })
+      .def(
+          "get_2d_matrix_view",
+          [](const LinearLayout &self,
+             std::optional<std::pair<std::string, std::string>> rowColDims,
+             int32_t threadsPerWarp) -> std::vector<std::vector<std::string>> {
+            auto *ctx = getLinearLayoutContext();
+
+            // Get output dimension names and sizes
+            auto outDims = self.getOutDims();
+            if (outDims.empty()) {
+              return {};
+            }
+
+            // Determine row and column dimensions
+            std::string rowDimName, colDimName;
+            if (rowColDims.has_value()) {
+              rowDimName = rowColDims->first;
+              colDimName = rowColDims->second;
+            } else if (outDims.size() >= 2) {
+              // Default to first two output dimensions
+              auto it = outDims.begin();
+              rowDimName = it->first.str();
+              ++it;
+              colDimName = it->first.str();
+            } else if (outDims.size() == 1) {
+              // Single dimension - treat as 1D layout
+              rowDimName = outDims.begin()->first.str();
+              colDimName = "";
+            }
+
+            // Validate dimensions exist
+            auto rowDimAttr = mlir::StringAttr::get(ctx, rowDimName);
+            auto colDimAttr = mlir::StringAttr::get(ctx, colDimName);
+
+            if (!self.hasOutDim(rowDimAttr)) {
+              throw std::invalid_argument("Row dimension '" + rowDimName +
+                                          "' not found in layout");
+            }
+            if (!colDimName.empty() && !self.hasOutDim(colDimAttr)) {
+              throw std::invalid_argument("Column dimension '" + colDimName +
+                                          "' not found in layout");
+            }
+
+            // Get dimension sizes
+            int32_t nRows = self.getOutDimSize(rowDimAttr);
+            int32_t nCols = colDimName.empty() ? 1 : self.getOutDimSize(colDimAttr);
+
+            // Initialize result matrix with empty strings
+            std::vector<std::vector<std::string>> result(nRows,
+                                                         std::vector<std::string>(nCols));
+
+            // Get input dimension information
+            auto inDims = self.getInDims();
+            int32_t numRegisters = 1;
+            int32_t numLanes = 1;
+            int32_t numWarps = 1;
+            int32_t numBlocks = 1;
+
+            for (const auto &[dimName, dimSize] : inDims) {
+              std::string name = dimName.str();
+              if (name == "register") {
+                numRegisters = dimSize;
+              } else if (name == "lane") {
+                numLanes = dimSize;
+              } else if (name == "warp") {
+                numWarps = dimSize;
+              } else if (name == "block") {
+                numBlocks = dimSize;
+              }
+            }
+
+            // Iterate over all hardware positions and fill the matrix
+            for (int32_t block = 0; block < numBlocks; ++block) {
+              for (int32_t warp = 0; warp < numWarps; ++warp) {
+                for (int32_t lane = 0; lane < numLanes; ++lane) {
+                  for (int32_t reg = 0; reg < numRegisters; ++reg) {
+                    // Build input dictionary
+                    std::vector<std::pair<mlir::StringAttr, int32_t>> inputs;
+                    for (const auto &[dimName, _] : inDims) {
+                      std::string name = dimName.str();
+                      int32_t value = 0;
+                      if (name == "register")
+                        value = reg;
+                      else if (name == "lane")
+                        value = lane;
+                      else if (name == "warp")
+                        value = warp;
+                      else if (name == "block")
+                        value = block;
+                      inputs.emplace_back(dimName, value);
+                    }
+
+                    // Apply layout to get output coordinates
+                    auto outputs = self.apply(inputs);
+
+                    // Find row and column indices
+                    int32_t rowIdx = 0;
+                    int32_t colIdx = 0;
+                    bool foundRow = false, foundCol = false;
+
+                    for (const auto &[outDim, outVal] : outputs) {
+                      if (outDim == rowDimAttr) {
+                        rowIdx = outVal;
+                        foundRow = true;
+                      }
+                      if (!colDimName.empty() && outDim == colDimAttr) {
+                        colIdx = outVal;
+                        foundCol = true;
+                      }
+                    }
+
+                    if (!foundRow || (!colDimName.empty() && !foundCol)) {
+                      continue;
+                    }
+
+                    // Validate indices
+                    if (rowIdx < 0 || rowIdx >= nRows || colIdx < 0 ||
+                        colIdx >= nCols) {
+                      continue;
+                    }
+
+                    // Build hardware parameter label
+                    std::string label;
+                    if (numRegisters > 1) {
+                      label += "r" + std::to_string(reg);
+                    }
+
+                    // Calculate global thread ID
+                    int32_t globalThreadId = lane + warp * threadsPerWarp;
+                    if (numLanes > 1 || numWarps > 1) {
+                      label += "t" + std::to_string(globalThreadId);
+                    }
+
+                    if (numWarps > 1) {
+                      label += "w" + std::to_string(warp);
+                    }
+
+                    if (numBlocks > 1) {
+                      label += "b" + std::to_string(block);
+                    }
+
+                    // Add to matrix cell (append if multiple entries)
+                    if (!result[rowIdx][colIdx].empty()) {
+                      result[rowIdx][colIdx] += ",";
+                    }
+                    result[rowIdx][colIdx] += label;
+                  }
+                }
+              }
+            }
+
+            // Mark empty cells
+            for (int32_t i = 0; i < nRows; ++i) {
+              for (int32_t j = 0; j < nCols; ++j) {
+                if (result[i][j].empty()) {
+                  result[i][j] = ".";
+                }
+              }
+            }
+
+            return result;
+          },
+          py::arg("row_col_dims") = py::none(),
+          py::arg("threads_per_warp") = 32,
+          R"doc(
+          Returns a 2D matrix view of the layout showing hardware parameter distribution.
+
+          Each cell in the matrix represents a tensor element (identified by its output
+          coordinates), and the cell value shows which hardware location (register,
+          thread, warp, block) maps to that tensor element.
+
+          Args:
+              row_col_dims: Optional tuple of (row_dimension, column_dimension) output
+                  dimension names. If None, uses the first two output dimensions.
+              threads_per_warp: Number of threads per warp (default 32 for NVIDIA).
+
+          Returns:
+              2D list of strings where each cell contains hardware parameter labels
+              in format "r{register}t{thread}w{warp}b{block}".
+          )doc");
 }
