@@ -297,6 +297,86 @@ struct SplitOpConversion : public ConvertOpToLLVMPattern<SplitOp> {
     return success();
   }
 };
+struct ExtractTensorOpConversion
+    : public ConvertOpToLLVMPattern<ExtractTensorOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(ExtractTensorOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto dstTy = cast<RankedTensorType>(op.getType());
+    auto srcVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+
+    auto srcLL = toLinearLayout(srcTy);
+    auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
+    auto srcReplicaLL = getReplicaLinearLayout(srcTy).transposeOuts(outDimNames);
+    auto replicaShape = getShapePerCTATile(srcTy);
+    auto dstLL = toLinearLayout(dstTy).transposeOuts(outDimNames);
+
+    SmallVector<int32_t> offsets;
+    offsets.reserve(replicaShape.size());
+    for (auto [coord, tile] :
+         llvm::zip_equal(op.getReplicaCoords(), replicaShape)) {
+      offsets.push_back(coord * static_cast<int32_t>(tile));
+    }
+
+    auto *ctx = rewriter.getContext();
+    TritonLLVMOpBuilder b(loc, rewriter);
+    auto kReg = StringAttr::get(ctx, "register");
+    auto kLane = StringAttr::get(ctx, "lane");
+    auto kWarp = StringAttr::get(ctx, "warp");
+    auto kBlock = StringAttr::get(ctx, "block");
+    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+
+    SmallVector<std::pair<StringAttr, Value>> srcReplicaCommonIndices = {
+        {kReg, b.i32_val(0)},
+    };
+    if (srcReplicaLL.hasInDim(kLane))
+      srcReplicaCommonIndices.push_back({kLane, laneId});
+    if (srcReplicaLL.hasInDim(kWarp))
+      srcReplicaCommonIndices.push_back({kWarp, warpId});
+    if (srcReplicaLL.hasInDim(kBlock))
+      srcReplicaCommonIndices.push_back({kBlock, b.i32_val(0)});
+    auto srcInverseLL = srcLL.pseudoinvert();
+    int dstRegCount = dstLL.getInDimSize(kReg);
+
+    SmallVector<Value> resultVals;
+    resultVals.reserve(dstRegCount);
+    for (int regId = 0; regId < dstRegCount; ++regId) {
+      auto srcReplicaCoords = applyLinearLayoutVec(loc, rewriter, srcReplicaLL,
+                                                   srcReplicaCommonIndices,
+                                                   {static_cast<uint32_t>(regId)})
+                                 .front();
+      for (auto [dim, offset] : llvm::enumerate(offsets))
+        srcReplicaCoords[dim].second =
+            b.add(srcReplicaCoords[dim].second, b.i32_val(offset));
+
+      auto srcHardware = applyLinearLayout(loc, rewriter, srcInverseLL,
+                                           srcReplicaCoords);
+      Value srcReg = b.i32_val(0);
+      for (auto [dim, value] : srcHardware) {
+        if (dim == kReg) {
+          srcReg = value;
+          break;
+        }
+      }
+
+      Value result = srcVals.front();
+      for (size_t idx = 1; idx < srcVals.size(); ++idx) {
+        result = b.select(b.icmp_eq(srcReg, b.i32_val(idx)), srcVals[idx],
+                          result);
+      }
+      resultVals.push_back(result);
+    }
+
+    Value ret = packLLElements(loc, getTypeConverter(), resultVals, rewriter,
+                               dstTy);
+    rewriter.replaceOp(op, ret);
+    return success();
+  }
+};
 struct ReshapeOpConversion : public ConvertOpToLLVMPattern<ReshapeOp> {
   using OpAdaptor = typename ReshapeOp::Adaptor;
   explicit ReshapeOpConversion(LLVMTypeConverter &typeConverter,
@@ -593,6 +673,7 @@ void mlir::triton::populateViewOpToLLVMPatterns(
   patterns.add<CatOpConversion>(typeConverter, benefit);
   patterns.add<JoinOpConversion>(typeConverter, benefit);
   patterns.add<SplitOpConversion>(typeConverter, benefit);
+  patterns.add<ExtractTensorOpConversion>(typeConverter, benefit);
   patterns.add<MemDescTransOpConversion, MemDescReshapeOpConversion>(
       typeConverter, benefit);
   patterns.add<TransOpConversion>(typeConverter, benefit);

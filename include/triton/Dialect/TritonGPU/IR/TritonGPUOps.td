@@ -42,6 +42,35 @@ def TTG_ConvertLayoutOp : TTG_Op<"convert_layout",
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 }
 
+def TTG_ExtractTensorOp : TTG_Op<"extract_tensor", [Pure]> {
+  let summary = "extract a replica tensor";
+
+  let description = [{
+    Extract a single replica tensor from a distributed tensor in registers.
+
+    The replica coordinates index the tensor in units of the source tensor's
+    CTA-tile replica shape. The result must stay within a single source replica.
+    It may further slice the register vector inside that replica. The extracted
+    values are taken in the source replica's thread-local register order and
+    are then reinterpreted using the result layout. This preserves the source
+    tensor's thread and warp participation, but the result need not be a
+    logical contiguous slice of the source tensor.
+
+    This operation is restricted to pure register extraction: it does not
+    change the layout, use shared memory, or require inter-thread exchange.
+  }];
+
+  let arguments = (ins TT_Tensor:$src, DenseI32ArrayAttr:$replicaCoords);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $src `[` custom<Offsets>($replicaCoords) `]` attr-dict `:` type($src)
+    `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
 def TTG_AsyncWaitOp : TTG_Op<"async_wait"> {
   let summary = "async wait";
 

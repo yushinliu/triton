@@ -326,6 +326,77 @@ SmallVector<int64_t> getShapePerCTA(Type type) {
   return getShapePerCTA(tensorType.getEncoding(), tensorType.getShape());
 }
 
+LinearLayout getReplicaLinearLayout(RankedTensorType type) {
+  auto ll = toLinearLayout(type);
+  auto llEnc = toLinearEncoding(type);
+  auto outDims = ll.getOutDims();
+
+  SmallVector<unsigned> replicaShape;
+  replicaShape.reserve(outDims.size());
+  for (auto [size, thread, warp] : llvm::zip_equal(
+           llEnc.getSizePerThread(), llEnc.getThreadsPerWarp(),
+           llEnc.getWarpsPerCTA())) {
+    replicaShape.push_back(size * thread * warp);
+  }
+
+  auto replicaBases = ll.getBases();
+  for (auto [dim, replicaDimSize] :
+       llvm::zip_equal(llvm::seq<size_t>(0, replicaShape.size()),
+                       replicaShape)) {
+    for (auto &[inDim, inDimBases] : replicaBases) {
+      (void)inDim;
+      for (auto &basis : inDimBases) {
+        if (basis[dim] >= static_cast<int32_t>(replicaDimSize))
+          basis[dim] = 0;
+      }
+    }
+    outDims[dim].second = replicaDimSize;
+  }
+
+  return LinearLayout(replicaBases, outDims, /*requireSurjective=*/false);
+}
+
+SmallVector<int64_t> getShapePerCTATile(RankedTensorType type) {
+  return llvm::to_vector(
+      llvm::map_range(getReplicaLinearLayout(type).getOutDimSizes(),
+                      [](int32_t dimSize) { return static_cast<int64_t>(dimSize); }));
+}
+
+ElemCoord getElemCoordinatesFromRegisterId(const LinearLayout &layout,
+                                           unsigned regId,
+                                           MLIRContext *ctx) {
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  StringAttr kLane = StringAttr::get(ctx, "lane");
+  StringAttr kWarp = StringAttr::get(ctx, "warp");
+  StringAttr kBlock = StringAttr::get(ctx, "block");
+  SmallVector<std::pair<StringAttr, int32_t>> hardwareLocation = {
+      {kReg, static_cast<int32_t>(regId)}};
+  if (layout.hasInDim(kLane))
+    hardwareLocation.push_back({kLane, 0});
+  if (layout.hasInDim(kWarp))
+    hardwareLocation.push_back({kWarp, 0});
+  if (layout.hasInDim(kBlock))
+    hardwareLocation.push_back({kBlock, 0});
+  return layout.apply(hardwareLocation);
+}
+
+std::optional<int> getRegisterIdFromCoordinates(const LinearLayout &layout,
+                                                ElemCoord coordinates,
+                                                MLIRContext *ctx) {
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  auto dims = layout.pseudoinvert().apply(coordinates);
+  std::optional<int> regId;
+  for (auto [dim, value] : dims) {
+    if (dim == kReg) {
+      regId = value;
+      continue;
+    }
+    if (value != 0)
+      return std::nullopt;
+  }
+  return regId;
+}
+
 SmallVector<int64_t> getAllocationShapePerCTA(Type type) {
   auto tensorType = cast<TensorOrMemDesc>(type);
   return getAllocationShapePerCTA(tensorType.getEncoding(),

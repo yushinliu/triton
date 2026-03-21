@@ -11,7 +11,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/LogicalResult.h"
+#include "mlir/Support/LogicalResult.h"
 
 // Provide custom directive handlers for declarative assemblyFormat.
 // They must be visible before including the generated op classes.
@@ -36,10 +36,156 @@ static void printOffsets(mlir::OpAsmPrinter &p, mlir::Operation *op,
   llvm::interleaveComma(vals, p, [&](int32_t v) { p << v; });
 }
 
+static std::string stringifyElemCoord(mlir::triton::gpu::ElemCoord coords) {
+  std::string result;
+  llvm::raw_string_ostream os(result);
+  os << "[";
+  llvm::interleaveComma(coords, os,
+                        [&](const auto &coord) { os << coord.second; });
+  os << "]";
+  return result;
+}
+
+static std::optional<int32_t>
+getRegisterIdForThread(const mlir::triton::LinearLayout &layout,
+                       mlir::triton::gpu::ElemCoord coordinates, int32_t lane,
+                       int32_t warp, mlir::MLIRContext *ctx) {
+  auto kReg = mlir::StringAttr::get(ctx, "register");
+  auto kLane = mlir::StringAttr::get(ctx, "lane");
+  auto kWarp = mlir::StringAttr::get(ctx, "warp");
+  auto kBlock = mlir::StringAttr::get(ctx, "block");
+
+  llvm::SmallVector<std::pair<mlir::StringAttr, int32_t>> hardwareLocation = {
+      {kReg, 0}};
+  if (layout.hasInDim(kLane))
+    hardwareLocation.push_back({kLane, lane});
+  if (layout.hasInDim(kWarp))
+    hardwareLocation.push_back({kWarp, warp});
+  if (layout.hasInDim(kBlock))
+    hardwareLocation.push_back({kBlock, 0});
+
+  auto threadCoords = layout.apply(hardwareLocation);
+  for (auto [idx, threadCoord] : llvm::enumerate(threadCoords)) {
+    coordinates[idx].second -= threadCoord.second;
+  }
+
+  return mlir::triton::gpu::getRegisterIdFromCoordinates(layout, coordinates,
+                                                         ctx);
+}
+
 #define GET_OP_CLASSES
 #include "triton/Dialect/TritonGPU/IR/Ops.cpp.inc"
 
 namespace mlir::triton::gpu {
+
+LogicalResult ExtractTensorOp::verify() {
+  auto srcTy = cast<RankedTensorType>(getSrc().getType());
+  auto dstTy = cast<RankedTensorType>(getResult().getType());
+
+  if (srcTy.getElementType() != dstTy.getElementType())
+    return emitError("result element type must match source element type");
+  if (srcTy.getRank() != dstTy.getRank())
+    return emitError("result rank must be equal to source rank");
+  if (!srcTy.getEncoding() || !dstTy.getEncoding())
+    return emitError("source and result must both have a distributed layout");
+
+  auto replicaCoords = getReplicaCoords();
+  if (replicaCoords.size() != srcTy.getRank())
+    return emitError("replica coordinates must have the same rank as input");
+
+  auto srcLL = toLinearLayout(srcTy);
+  auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
+  auto srcReplicaLL = getReplicaLinearLayout(srcTy).transposeOuts(outDimNames);
+  auto replicaShape = getShapePerCTATile(srcTy);
+  auto dstLL = toLinearLayout(dstTy).transposeOuts(outDimNames);
+
+  auto srcShape = srcTy.getShape();
+  auto dstShape = dstTy.getShape();
+  for (auto [dim, coord, replicaDim, resultDim] :
+       llvm::zip_equal(llvm::seq<unsigned>(0, srcTy.getRank()), replicaCoords,
+                       replicaShape, dstShape)) {
+    if (resultDim > replicaDim) {
+      return emitError() << "result shape cannot exceed replica shape "
+                         << ArrayRef(replicaShape) << " at dimension " << dim;
+    }
+    if (coord < 0 ||
+        static_cast<int64_t>(coord) * replicaDim + resultDim > srcShape[dim]) {
+      return emitError() << "invalid replica coordinate " << coord
+                         << " at dimension " << dim;
+    }
+  }
+
+  SmallVector<int32_t> offsets;
+  offsets.reserve(replicaCoords.size());
+  for (auto [coord, tile] : llvm::zip_equal(replicaCoords, replicaShape))
+    offsets.push_back(coord * static_cast<int32_t>(tile));
+
+  auto *ctx = getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  auto kBlock = StringAttr::get(ctx, "block");
+
+  if (dstLL.hasInDim(kLane) != srcReplicaLL.hasInDim(kLane) ||
+      (dstLL.hasInDim(kLane) &&
+       dstLL.getInDimSize(kLane) != srcReplicaLL.getInDimSize(kLane))) {
+    return emitError("result layout must preserve source lane participation");
+  }
+  if (dstLL.hasInDim(kWarp) != srcReplicaLL.hasInDim(kWarp) ||
+      (dstLL.hasInDim(kWarp) &&
+       dstLL.getInDimSize(kWarp) != srcReplicaLL.getInDimSize(kWarp))) {
+    return emitError("result layout must preserve source warp participation");
+  }
+  if (dstLL.hasInDim(kBlock) && dstLL.getInDimSize(kBlock) != 1) {
+    return emitError("result layout must stay within a single source replica");
+  }
+
+  int laneCount = dstLL.hasInDim(kLane) ? dstLL.getInDimSize(kLane) : 1;
+  int warpCount = dstLL.hasInDim(kWarp) ? dstLL.getInDimSize(kWarp) : 1;
+  int dstRegCount = dstLL.getInDimSize(kReg);
+  int srcReplicaRegCount = srcReplicaLL.getInDimSize(kReg);
+  if (dstRegCount > srcReplicaRegCount) {
+    return emitError("result register count cannot exceed the source replica "
+                     "register count");
+  }
+  for (int regId = 0; regId < dstRegCount; ++regId) {
+    for (int lane = 0; lane < laneCount; ++lane) {
+      for (int warp = 0; warp < warpCount; ++warp) {
+        SmallVector<std::pair<StringAttr, int32_t>> srcReplicaHardware = {
+            {kReg, regId}};
+        if (srcReplicaLL.hasInDim(kLane))
+          srcReplicaHardware.push_back({kLane, lane});
+        if (srcReplicaLL.hasInDim(kWarp))
+          srcReplicaHardware.push_back({kWarp, warp});
+        if (srcReplicaLL.hasInDim(kBlock))
+          srcReplicaHardware.push_back({kBlock, 0});
+        auto elemCoords = srcReplicaLL.apply(srcReplicaHardware);
+        bool exceedsReplica = false;
+        for (auto [dim, limit] : llvm::enumerate(replicaShape)) {
+          exceedsReplica |=
+              elemCoords[dim].second < 0 || elemCoords[dim].second >= limit;
+        }
+        if (exceedsReplica) {
+          return emitError("result layout must stay within a single source "
+                           "replica");
+        }
+        for (auto [dim, offset] : llvm::enumerate(offsets))
+          elemCoords[dim].second += offset;
+
+        std::optional<int32_t> srcReg =
+            getRegisterIdForThread(srcLL, elemCoords, lane, warp, ctx);
+        if (!srcReg) {
+          return emitError()
+                 << "no source register holds the element for destination "
+                    "index "
+                 << stringifyElemCoord(elemCoords);
+        }
+      }
+    }
+  }
+
+  return success();
+}
 
 namespace {
 

@@ -88,6 +88,7 @@ private:
 
 using LinearLayoutCache = Cache<CacheKey, LinearLayout>;
 using LinearEncodingCache = Cache<CacheKey, LinearEncodingAttr>;
+using ElemCoord = SmallVector<std::pair<StringAttr, int32_t>>;
 } // namespace mlir::triton::gpu
 
 #define GET_OP_CLASSES
@@ -229,6 +230,15 @@ SmallVector<int64_t> getShapePerCTA(ArrayRef<unsigned> CTASplitNum,
                                     ArrayRef<int64_t> shape);
 SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape);
 SmallVector<int64_t> getShapePerCTA(Type type);
+SmallVector<int64_t> getShapePerCTATile(RankedTensorType type);
+
+LinearLayout getReplicaLinearLayout(RankedTensorType type);
+ElemCoord getElemCoordinatesFromRegisterId(const LinearLayout &layout,
+                                           unsigned regId,
+                                           MLIRContext *ctx);
+std::optional<int> getRegisterIdFromCoordinates(const LinearLayout &layout,
+                                                ElemCoord coordinates,
+                                                MLIRContext *ctx);
 
 // Returns the shape per CTA, which is "physically" allocated.
 // Such shapes may be bigger than the logical one due to, for example, padding
