@@ -39,7 +39,7 @@ module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32
     // CHECK-LABEL: llvm.func @extract_replica_partial
     // CHECK-NOT: llvm.add
     // CHECK-NOT: llvm.select
-    %0 = ttg.extract_tensor %arg0 [1, 2] : tensor<128x128xi32, #blocked> -> tensor<32x16xi32, #blocked_partial>
+    %0 = ttg.extract_tensor %arg0 [1, 4] : tensor<128x128xi32, #blocked> -> tensor<32x16xi32, #blocked_partial>
     tt.return
   }
 }
@@ -54,7 +54,7 @@ module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32
     // CHECK-LABEL: llvm.func @extract_multi_replica_partial
     // CHECK-NOT: llvm.add
     // CHECK-NOT: llvm.select
-    %0 = ttg.extract_tensor %arg0 [1, 2] : tensor<128x128xi32, #blocked> -> tensor<64x16xi32, #blocked_partial>
+    %0 = ttg.extract_tensor %arg0 [1, 4] : tensor<128x128xi32, #blocked> -> tensor<64x16xi32, #blocked_partial>
     tt.return
   }
 }
@@ -71,7 +71,7 @@ module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32
     // CHECK-NOT: llvm.select
     // CHECK-COUNT-64: %{{.*}} = llvm.extractvalue %arg0[{{.*}}] : !llvm.struct
     // CHECK-COUNT-4: %{{.*}} = llvm.insertvalue %{{.*}} : !llvm.struct
-    %0 = ttg.extract_tensor %arg0 [1, 2] : tensor<128x128xi32, #blocked> -> tensor<32x16xi32, #blocked2>
+    %0 = ttg.extract_tensor %arg0 [1, 4] : tensor<128x128xi32, #blocked> -> tensor<32x16xi32, #blocked2>
     tt.return
   }
 }
@@ -88,7 +88,7 @@ module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32
     // CHECK-NOT: llvm.select
     // CHECK-COUNT-64: %{{.*}} = llvm.extractvalue %arg0[{{.*}}] : !llvm.struct
     // CHECK-COUNT-4: %{{.*}} = llvm.insertvalue %{{.*}} : !llvm.struct
-    %0 = ttg.extract_tensor %arg0 [1, 2] : tensor<128x128xi32, #blocked> -> tensor<32x16xi32, #blocked2>
+    %0 = ttg.extract_tensor %arg0 [1, 4] : tensor<128x128xi32, #blocked> -> tensor<32x16xi32, #blocked2>
     tt.return
   }
 }

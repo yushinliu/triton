@@ -27,7 +27,7 @@ def _blocked2_threads_per_warp_layout(threads_per_warp: int):
     pytest.skip(f"unsupported warp size {threads_per_warp}")
 
 
-def _expected_blocked2(x: torch.Tensor, threads_per_warp: int):
+def _expected_blocked2(x: torch.Tensor, threads_per_warp: int, coords):
     if threads_per_warp == 32:
         rows_per_unique_warp = 8
         src_rows_per_warp = 4
@@ -37,15 +37,17 @@ def _expected_blocked2(x: torch.Tensor, threads_per_warp: int):
     else:
         pytest.skip(f"unsupported warp size {threads_per_warp}")
 
+    base_row = coords[0] * 32
+    base_col = coords[1] * 16
     expected = torch.empty((32, 16), device=x.device, dtype=x.dtype)
     for dst_row in range(32):
         row_in_warp = dst_row % rows_per_unique_warp
-        src_row = (32 + src_rows_per_warp * (dst_row // rows_per_unique_warp) +
+        src_row = (base_row + src_rows_per_warp * (dst_row // rows_per_unique_warp) +
                    row_in_warp // 2)
         for dst_col in range(16):
             group = dst_col // 8
             within_group = dst_col % 8
-            src_col = (64 + 16 * (row_in_warp % 2) +
+            src_col = (base_col + 16 * (row_in_warp % 2) +
                        4 * (within_group // 2) + 2 * group +
                        (within_group % 2))
             expected[dst_row, dst_col] = x[src_row, src_col]
@@ -113,7 +115,7 @@ def _get_register_id_from_coords(layout, coords):
 
 
 def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shape,
-                             result_size_per_thread,
+                             coords, result_size_per_thread,
                              result_threads_per_warp_layout):
     src_shape = (128, 128)
     src_size_per_thread = (1, 4)
@@ -125,7 +127,8 @@ def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shap
     coverage_shape = tuple(
         max(replica_dim, result_dim)
         for replica_dim, result_dim in zip(replica_shape, result_shape))
-    offsets = (replica_shape[0], 2 * replica_shape[1])
+    src_start = tuple(
+        coord * size for coord, size in zip(coords, result_shape))
 
     src_layout = _linear_layout(src_shape, src_size_per_thread,
                                 tuple(src_threads_per_warp),
@@ -136,7 +139,7 @@ def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shap
     extracted_layout = _extract_linear_layout(src_layout, coverage_shape)
     src_reg_for_dst_reg = []
     for reg in range(_in_dim_size(dst_layout, "register")):
-        src_coords = extracted_layout.apply({
+        extracted_coords = extracted_layout.apply({
             "register": reg,
             "lane": 0,
             "warp": 0,
@@ -145,7 +148,8 @@ def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shap
         src_reg_for_dst_reg.append(
             _get_register_id_from_coords(
                 src_layout,
-                (src_coords["dim0"] + offsets[0], src_coords["dim1"] + offsets[1]),
+                (extracted_coords["dim0"] + src_start[0],
+                 extracted_coords["dim1"] + src_start[1]),
             ))
 
     expected = torch.empty(result_shape, device=x.device, dtype=x.dtype)
@@ -160,14 +164,14 @@ def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shap
                     "block": 0,
                 }
                 dst_coords = dst_layout.apply(hardware_point)
-                src_coords = src_layout.apply({
+                source_coords = src_layout.apply({
                     "register": src_reg_for_dst_reg[reg],
                     "lane": lane,
                     "warp": warp,
                     "block": 0,
                 })
                 dst_row, dst_col = dst_coords["dim0"], dst_coords["dim1"]
-                src_row, src_col = src_coords["dim0"], src_coords["dim1"]
+                src_row, src_col = source_coords["dim0"], source_coords["dim1"]
 
                 value = x[src_row, src_col]
                 if visited[dst_row, dst_col].item():
@@ -182,16 +186,16 @@ def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shap
 
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize(
-    "result_shape, result_size_per_thread, result_layout_kind",
+    "coords, result_shape, result_size_per_thread, result_layout_kind",
     [
-        ((32, 32), "[1, 4]", "same"),
-        ((64, 32), "[1, 4]", "same"),
-        ((32, 16), "[1, 2]", "same"),
-        ((64, 16), "[1, 2]", "same"),
-        ((32, 16), "[1, 2]", "blocked2"),
+        ("[1, 2]", (32, 32), "[1, 4]", "same"),
+        ("[1, 2]", (64, 32), "[1, 4]", "same"),
+        ("[1, 4]", (32, 16), "[1, 2]", "same"),
+        ("[1, 4]", (64, 16), "[1, 2]", "same"),
+        ("[1, 4]", (32, 16), "[1, 2]", "blocked2"),
     ],
 )
-def test_extract_tensor_ttgir(dtype, result_shape, result_size_per_thread,
+def test_extract_tensor_ttgir(dtype, coords, result_shape, result_size_per_thread,
                               result_layout_kind, tmp_path: pathlib.Path,
                               device):
     current_target = triton.runtime.driver.active.get_current_target()
@@ -225,7 +229,7 @@ def test_extract_tensor_ttgir(dtype, result_shape, result_size_per_thread,
         %src_ptrs = tt.addptr %src_ptr, %src_ofs : tensor<128x128x!tt.ptr<f16>, #src_blocked>, tensor<128x128xi32, #src_blocked>
         %src = tt.load %src_ptrs : tensor<128x128x!tt.ptr<f16>, #src_blocked>
 
-        %tile = ttg.extract_tensor %src [1, 2] : tensor<128x128xf16, #src_blocked> -> tensor<{result_m}x{result_n}xf16, #dst_blocked>
+        %tile = ttg.extract_tensor %src {coords} : tensor<128x128xf16, #src_blocked> -> tensor<{result_m}x{result_n}xf16, #dst_blocked>
 
         %dst_row = tt.make_range {{end = {result_m} : i32, start = 0 : i32}} : tensor<{result_m}xi32, #ttg.slice<{{dim = 1, parent = #dst_blocked}}>>
         %dst_col = tt.make_range {{end = {result_n} : i32, start = 0 : i32}} : tensor<{result_n}xi32, #ttg.slice<{{dim = 0, parent = #dst_blocked}}>>
@@ -251,13 +255,15 @@ def test_extract_tensor_ttgir(dtype, result_shape, result_size_per_thread,
     y = torch.empty(result_shape, device=device, dtype=dtype)
 
     kernel[(1, 1, 1)](x.data_ptr(), y.data_ptr())
+    parsed_coords = tuple(ast.literal_eval(coords))
     if result_layout_kind == "blocked2":
-        expected = _expected_blocked2(x, threads_per_warp)
+        expected = _expected_blocked2(x, threads_per_warp, parsed_coords)
     else:
         expected = _expected_extract_tensor(
             x,
             threads_per_warp,
             result_shape,
+            parsed_coords,
             tuple(ast.literal_eval(result_size_per_thread)),
             tuple(result_tpw_layout),
         )

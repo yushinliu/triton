@@ -328,11 +328,9 @@ struct ExtractTensorOpConversion
         getExtractTensorLinearLayout(srcTy, coverageShape).transposeOuts(outDimNames);
 
     SmallVector<int32_t> offsets;
-    offsets.reserve(replicaShape.size());
-    for (auto [coord, tile] :
-         llvm::zip_equal(op.getReplicaCoords(), replicaShape)) {
-      offsets.push_back(static_cast<int32_t>(coord * tile));
-    }
+    offsets.reserve(dstTy.getRank());
+    for (auto [coord, resultDim] : llvm::zip_equal(op.getCoords(), dstTy.getShape()))
+      offsets.push_back(static_cast<int32_t>(coord * resultDim));
 
     auto *ctx = rewriter.getContext();
     auto kReg = StringAttr::get(ctx, "register");

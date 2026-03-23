@@ -111,9 +111,9 @@ LogicalResult ExtractTensorOp::verify() {
   if (!srcTy.getEncoding() || !dstTy.getEncoding())
     return emitError("source and result must both have a distributed layout");
 
-  auto replicaCoords = getReplicaCoords();
-  if (replicaCoords.size() != srcTy.getRank())
-    return emitError("replica coordinates must have the same rank as input");
+  auto coords = getCoords();
+  if (coords.size() != srcTy.getRank())
+    return emitError("coordinates must have the same rank as input");
 
   auto srcLL = toLinearLayout(srcTy);
   auto replicaShape = getShapePerCTATile(srcTy);
@@ -130,21 +130,20 @@ LogicalResult ExtractTensorOp::verify() {
 
   auto srcShape = srcTy.getShape();
   auto dstShape = dstTy.getShape();
-  for (auto [dim, coord, replicaDim, coverageDim] :
-       llvm::zip_equal(llvm::seq<unsigned>(0, srcTy.getRank()), replicaCoords,
-                       replicaShape, coverageShape)) {
+  for (auto [dim, coord, resultDim, coverageDim] :
+       llvm::zip_equal(llvm::seq<unsigned>(0, srcTy.getRank()), coords,
+                       dstShape, coverageShape)) {
     if (coord < 0 ||
-        static_cast<int64_t>(coord) * replicaDim + coverageDim >
-            srcShape[dim]) {
-      return emitError() << "invalid replica coordinate " << coord
+        static_cast<int64_t>(coord) * resultDim + coverageDim > srcShape[dim]) {
+      return emitError() << "invalid coordinate " << coord
                          << " at dimension " << dim;
     }
   }
 
   SmallVector<int32_t> offsets;
-  offsets.reserve(replicaCoords.size());
-  for (auto [coord, tile] : llvm::zip_equal(replicaCoords, replicaShape))
-    offsets.push_back(static_cast<int32_t>(coord * tile));
+  offsets.reserve(coords.size());
+  for (auto [coord, resultDim] : llvm::zip_equal(coords, dstShape))
+    offsets.push_back(static_cast<int32_t>(coord * resultDim));
 
   auto *ctx = getContext();
   auto kReg = StringAttr::get(ctx, "register");

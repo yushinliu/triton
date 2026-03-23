@@ -43,15 +43,17 @@ def TTG_ConvertLayoutOp : TTG_Op<"convert_layout",
 }
 
 def TTG_ExtractTensorOp : TTG_Op<"extract_tensor", [Pure]> {
-  let summary = "extract a replica tensor";
+  let summary = "extract a tensor from tile coordinates";
 
   let description = [{
-    Extract a single replica tensor from a distributed tensor in registers.
+    Extract a tensor from a distributed tensor in registers.
 
-    The replica coordinates index the tensor in units of the source tensor's
-    CTA-tile replica shape. The result must stay within a single source replica.
-    It may further slice the register vector inside that replica. The extracted
-    values are taken in the source replica's thread-local register order and
+    The coordinates are measured in units of the result tensor shape. Along
+    each dimension, the covered source span begins at
+    `coord[dim] * resultShape[dim]`. The result must stay within the source
+    tensor and may span multiple source replicas. It may further slice the
+    register vector inside that covered source span. The extracted values are
+    taken in the source span's thread-local register order and
     are then reinterpreted using the result layout. This preserves the source
     tensor's thread and warp participation, but the result need not be a
     logical contiguous slice of the source tensor.
@@ -61,11 +63,11 @@ def TTG_ExtractTensorOp : TTG_Op<"extract_tensor", [Pure]> {
   }];
 
   let arguments = (ins AnyTypeOf<[TT_TensorPtr, TT_Tensor]>:$src,
-                       DenseI32ArrayAttr:$replicaCoords);
+                       DenseI32ArrayAttr:$coords);
   let results = (outs AnyTypeOf<[TT_TensorPtr, TT_Tensor]>:$result);
 
   let assemblyFormat = [{
-    $src `[` custom<Offsets>($replicaCoords) `]` attr-dict `:` type($src)
+    $src `[` custom<Offsets>($coords) `]` attr-dict `:` type($src)
     `->` type($result)
   }];
 
