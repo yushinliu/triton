@@ -6,6 +6,8 @@
 module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @extract_blocked_replica(%arg0: tensor<128x128xi32, #blocked>) {
     // CHECK-LABEL: llvm.func @extract_blocked_replica
+    // CHECK-NOT: llvm.add
+    // CHECK-NOT: llvm.select
     // CHECK-COUNT-64: %{{.*}} = llvm.extractvalue %arg0[{{.*}}] : !llvm.struct
     // CHECK-COUNT-4: %{{.*}} = llvm.insertvalue %{{.*}} : !llvm.struct
     %0 = ttg.extract_tensor %arg0 [1, 2] : tensor<128x128xi32, #blocked> -> tensor<32x32xi32, #blocked>
@@ -21,6 +23,8 @@ module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32
 module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @extract_blocked_relayout(%arg0: tensor<128x128xi32, #blocked>) {
     // CHECK-LABEL: llvm.func @extract_blocked_relayout
+    // CHECK-NOT: llvm.add
+    // CHECK-NOT: llvm.select
     // CHECK-COUNT-64: %{{.*}} = llvm.extractvalue %arg0[{{.*}}] : !llvm.struct
     // CHECK-COUNT-4: %{{.*}} = llvm.insertvalue %{{.*}} : !llvm.struct
     %0 = ttg.extract_tensor %arg0 [1, 2] : tensor<128x128xi32, #blocked> -> tensor<32x16xi32, #blocked2>

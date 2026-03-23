@@ -60,8 +60,9 @@ def TTG_ExtractTensorOp : TTG_Op<"extract_tensor", [Pure]> {
     change the layout, use shared memory, or require inter-thread exchange.
   }];
 
-  let arguments = (ins TT_Tensor:$src, DenseI32ArrayAttr:$replicaCoords);
-  let results = (outs TT_Tensor:$result);
+  let arguments = (ins AnyTypeOf<[TT_TensorPtr, TT_Tensor]>:$src,
+                       DenseI32ArrayAttr:$replicaCoords);
+  let results = (outs AnyTypeOf<[TT_TensorPtr, TT_Tensor]>:$result);
 
   let assemblyFormat = [{
     $src `[` custom<Offsets>($replicaCoords) `]` attr-dict `:` type($src)

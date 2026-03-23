@@ -2,6 +2,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Support/DebugStringHelper.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -73,14 +74,35 @@ getRegisterIdForThread(const mlir::triton::LinearLayout &layout,
                                                          ctx);
 }
 
+static mlir::RankedTensorType getExtractTensorType(mlir::Type type) {
+  if (auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(type))
+    return tensorTy;
+  if (auto ptrTy = llvm::dyn_cast<mlir::triton::PointerType>(type))
+    return llvm::dyn_cast<mlir::RankedTensorType>(ptrTy.getPointeeType());
+  return {};
+}
+
 #define GET_OP_CLASSES
 #include "triton/Dialect/TritonGPU/IR/Ops.cpp.inc"
 
 namespace mlir::triton::gpu {
 
 LogicalResult ExtractTensorOp::verify() {
-  auto srcTy = cast<RankedTensorType>(getSrc().getType());
-  auto dstTy = cast<RankedTensorType>(getResult().getType());
+  Type srcType = getSrc().getType();
+  Type dstType = getResult().getType();
+  bool srcIsTensorPtr = isa<triton::PointerType>(srcType);
+  bool dstIsTensorPtr = isa<triton::PointerType>(dstType);
+  if (srcIsTensorPtr != dstIsTensorPtr) {
+    return emitError(
+        "source and result must both be tensors or both be tensor pointers");
+  }
+
+  auto srcTy = getExtractTensorType(srcType);
+  auto dstTy = getExtractTensorType(dstType);
+  if (!srcTy || !dstTy) {
+    return emitError(
+        "source and result must be ranked tensors or tensor pointers");
+  }
 
   if (srcTy.getElementType() != dstTy.getElementType())
     return emitError("result element type must match source element type");
@@ -118,7 +140,7 @@ LogicalResult ExtractTensorOp::verify() {
   SmallVector<int32_t> offsets;
   offsets.reserve(replicaCoords.size());
   for (auto [coord, tile] : llvm::zip_equal(replicaCoords, replicaShape))
-    offsets.push_back(coord * static_cast<int32_t>(tile));
+    offsets.push_back(static_cast<int32_t>(coord * tile));
 
   auto *ctx = getContext();
   auto kReg = StringAttr::get(ctx, "register");
@@ -149,6 +171,7 @@ LogicalResult ExtractTensorOp::verify() {
                      "register count");
   }
   for (int regId = 0; regId < dstRegCount; ++regId) {
+    std::optional<int32_t> representativeSrcReg;
     for (int lane = 0; lane < laneCount; ++lane) {
       for (int warp = 0; warp < warpCount; ++warp) {
         SmallVector<std::pair<StringAttr, int32_t>> srcReplicaHardware = {
@@ -179,6 +202,15 @@ LogicalResult ExtractTensorOp::verify() {
                  << "no source register holds the element for destination "
                     "index "
                  << stringifyElemCoord(elemCoords);
+        }
+        if (!representativeSrcReg) {
+          representativeSrcReg = srcReg;
+          continue;
+        }
+        if (*representativeSrcReg != *srcReg) {
+          return emitError(
+              "result layout must map each destination register to a single "
+              "source register without lane- or warp-dependent remapping");
         }
       }
     }

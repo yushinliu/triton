@@ -305,8 +305,13 @@ struct ExtractTensorOpConversion
   matchAndRewrite(ExtractTensorOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
-    auto dstTy = cast<RankedTensorType>(op.getType());
+    auto srcTy = dyn_cast<RankedTensorType>(op.getSrc().getType());
+    auto dstTy = dyn_cast<RankedTensorType>(op.getType());
+    if (!srcTy || !dstTy) {
+      return rewriter.notifyMatchFailure(
+          op, "tensor-pointer extract_tensor must be rewritten before LLVM "
+              "lowering");
+    }
     auto srcVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
 
     auto srcLL = toLinearLayout(srcTy);
@@ -319,56 +324,49 @@ struct ExtractTensorOpConversion
     offsets.reserve(replicaShape.size());
     for (auto [coord, tile] :
          llvm::zip_equal(op.getReplicaCoords(), replicaShape)) {
-      offsets.push_back(coord * static_cast<int32_t>(tile));
+      offsets.push_back(static_cast<int32_t>(coord * tile));
     }
 
     auto *ctx = rewriter.getContext();
-    TritonLLVMOpBuilder b(loc, rewriter);
     auto kReg = StringAttr::get(ctx, "register");
     auto kLane = StringAttr::get(ctx, "lane");
     auto kWarp = StringAttr::get(ctx, "warp");
     auto kBlock = StringAttr::get(ctx, "block");
-    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-
-    SmallVector<std::pair<StringAttr, Value>> srcReplicaCommonIndices = {
-        {kReg, b.i32_val(0)},
-    };
-    if (srcReplicaLL.hasInDim(kLane))
-      srcReplicaCommonIndices.push_back({kLane, laneId});
-    if (srcReplicaLL.hasInDim(kWarp))
-      srcReplicaCommonIndices.push_back({kWarp, warpId});
-    if (srcReplicaLL.hasInDim(kBlock))
-      srcReplicaCommonIndices.push_back({kBlock, b.i32_val(0)});
-    auto srcInverseLL = srcLL.pseudoinvert();
     int dstRegCount = dstLL.getInDimSize(kReg);
+
+    SmallVector<int32_t> srcRegForDstReg;
+    srcRegForDstReg.reserve(dstRegCount);
+    for (int regId = 0; regId < dstRegCount; ++regId) {
+      SmallVector<std::pair<StringAttr, int32_t>> srcReplicaHardware = {
+          {kReg, regId}};
+      if (srcReplicaLL.hasInDim(kLane))
+        srcReplicaHardware.push_back({kLane, 0});
+      if (srcReplicaLL.hasInDim(kWarp))
+        srcReplicaHardware.push_back({kWarp, 0});
+      if (srcReplicaLL.hasInDim(kBlock))
+        srcReplicaHardware.push_back({kBlock, 0});
+
+      auto srcElemCoords = srcReplicaLL.apply(srcReplicaHardware);
+      for (auto [dim, offset] : llvm::enumerate(offsets))
+        srcElemCoords[dim].second += offset;
+
+      auto srcReg = getRegisterIdFromCoordinates(srcLL, srcElemCoords, ctx);
+      if (!srcReg) {
+        return rewriter.notifyMatchFailure(
+            op, "failed to derive a static source register mapping");
+      }
+      srcRegForDstReg.push_back(*srcReg);
+    }
 
     SmallVector<Value> resultVals;
     resultVals.reserve(dstRegCount);
     for (int regId = 0; regId < dstRegCount; ++regId) {
-      auto srcReplicaCoords = applyLinearLayoutVec(loc, rewriter, srcReplicaLL,
-                                                   srcReplicaCommonIndices,
-                                                   {static_cast<uint32_t>(regId)})
-                                 .front();
-      for (auto [dim, offset] : llvm::enumerate(offsets))
-        srcReplicaCoords[dim].second =
-            b.add(srcReplicaCoords[dim].second, b.i32_val(offset));
-
-      auto srcHardware = applyLinearLayout(loc, rewriter, srcInverseLL,
-                                           srcReplicaCoords);
-      Value srcReg = b.i32_val(0);
-      for (auto [dim, value] : srcHardware) {
-        if (dim == kReg) {
-          srcReg = value;
-          break;
-        }
+      int32_t srcReg = srcRegForDstReg[regId];
+      if (srcReg < 0 || static_cast<size_t>(srcReg) >= srcVals.size()) {
+        return rewriter.notifyMatchFailure(
+            op, "static source register mapping is out of range");
       }
-
-      Value result = srcVals.front();
-      for (size_t idx = 1; idx < srcVals.size(); ++idx) {
-        result = b.select(b.icmp_eq(srcReg, b.i32_val(idx)), srcVals[idx],
-                          result);
-      }
-      resultVals.push_back(result);
+      resultVals.push_back(srcVals[srcReg]);
     }
 
     Value ret = packLLElements(loc, getTypeConverter(), resultVals, rewriter,
