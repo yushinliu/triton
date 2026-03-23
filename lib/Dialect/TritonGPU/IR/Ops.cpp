@@ -116,22 +116,26 @@ LogicalResult ExtractTensorOp::verify() {
     return emitError("replica coordinates must have the same rank as input");
 
   auto srcLL = toLinearLayout(srcTy);
-  auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
-  auto srcReplicaLL = getReplicaLinearLayout(srcTy).transposeOuts(outDimNames);
   auto replicaShape = getShapePerCTATile(srcTy);
+  auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
   auto dstLL = toLinearLayout(dstTy).transposeOuts(outDimNames);
+  SmallVector<int64_t> coverageShape;
+  coverageShape.reserve(srcTy.getRank());
+  for (auto [replicaDim, resultDim] :
+       llvm::zip_equal(replicaShape, dstTy.getShape())) {
+    coverageShape.push_back(std::max<int64_t>(replicaDim, resultDim));
+  }
+  auto srcMappingLL =
+      getExtractTensorLinearLayout(srcTy, coverageShape).transposeOuts(outDimNames);
 
   auto srcShape = srcTy.getShape();
   auto dstShape = dstTy.getShape();
-  for (auto [dim, coord, replicaDim, resultDim] :
+  for (auto [dim, coord, replicaDim, coverageDim] :
        llvm::zip_equal(llvm::seq<unsigned>(0, srcTy.getRank()), replicaCoords,
-                       replicaShape, dstShape)) {
-    if (resultDim > replicaDim) {
-      return emitError() << "result shape cannot exceed replica shape "
-                         << ArrayRef(replicaShape) << " at dimension " << dim;
-    }
+                       replicaShape, coverageShape)) {
     if (coord < 0 ||
-        static_cast<int64_t>(coord) * replicaDim + resultDim > srcShape[dim]) {
+        static_cast<int64_t>(coord) * replicaDim + coverageDim >
+            srcShape[dim]) {
       return emitError() << "invalid replica coordinate " << coord
                          << " at dimension " << dim;
     }
@@ -148,52 +152,49 @@ LogicalResult ExtractTensorOp::verify() {
   auto kWarp = StringAttr::get(ctx, "warp");
   auto kBlock = StringAttr::get(ctx, "block");
 
-  if (dstLL.hasInDim(kLane) != srcReplicaLL.hasInDim(kLane) ||
+  if (dstLL.hasInDim(kLane) != srcMappingLL.hasInDim(kLane) ||
       (dstLL.hasInDim(kLane) &&
-       dstLL.getInDimSize(kLane) != srcReplicaLL.getInDimSize(kLane))) {
+       dstLL.getInDimSize(kLane) != srcMappingLL.getInDimSize(kLane))) {
     return emitError("result layout must preserve source lane participation");
   }
-  if (dstLL.hasInDim(kWarp) != srcReplicaLL.hasInDim(kWarp) ||
+  if (dstLL.hasInDim(kWarp) != srcMappingLL.hasInDim(kWarp) ||
       (dstLL.hasInDim(kWarp) &&
-       dstLL.getInDimSize(kWarp) != srcReplicaLL.getInDimSize(kWarp))) {
+       dstLL.getInDimSize(kWarp) != srcMappingLL.getInDimSize(kWarp))) {
     return emitError("result layout must preserve source warp participation");
   }
   if (dstLL.hasInDim(kBlock) && dstLL.getInDimSize(kBlock) != 1) {
-    return emitError("result layout must stay within a single source replica");
+    return emitError("result layout must stay within a single source CTA");
   }
 
   int laneCount = dstLL.hasInDim(kLane) ? dstLL.getInDimSize(kLane) : 1;
   int warpCount = dstLL.hasInDim(kWarp) ? dstLL.getInDimSize(kWarp) : 1;
   int dstRegCount = dstLL.getInDimSize(kReg);
-  int srcReplicaRegCount = srcReplicaLL.getInDimSize(kReg);
-  if (dstRegCount > srcReplicaRegCount) {
-    return emitError("result register count cannot exceed the source replica "
+  int srcExtractRegCount = srcMappingLL.getInDimSize(kReg);
+  if (dstRegCount > srcExtractRegCount) {
+    return emitError("result register count cannot exceed the extracted source "
                      "register count");
   }
   for (int regId = 0; regId < dstRegCount; ++regId) {
     std::optional<int32_t> representativeSrcReg;
     for (int lane = 0; lane < laneCount; ++lane) {
       for (int warp = 0; warp < warpCount; ++warp) {
-        SmallVector<std::pair<StringAttr, int32_t>> srcReplicaHardware = {
+        SmallVector<std::pair<StringAttr, int32_t>> srcExtractHardware = {
             {kReg, regId}};
-        if (srcReplicaLL.hasInDim(kLane))
-          srcReplicaHardware.push_back({kLane, lane});
-        if (srcReplicaLL.hasInDim(kWarp))
-          srcReplicaHardware.push_back({kWarp, warp});
-        if (srcReplicaLL.hasInDim(kBlock))
-          srcReplicaHardware.push_back({kBlock, 0});
-        auto elemCoords = srcReplicaLL.apply(srcReplicaHardware);
-        bool exceedsReplica = false;
-        for (auto [dim, limit] : llvm::enumerate(replicaShape)) {
-          exceedsReplica |=
-              elemCoords[dim].second < 0 || elemCoords[dim].second >= limit;
-        }
-        if (exceedsReplica) {
-          return emitError("result layout must stay within a single source "
-                           "replica");
-        }
+        if (srcMappingLL.hasInDim(kLane))
+          srcExtractHardware.push_back({kLane, lane});
+        if (srcMappingLL.hasInDim(kWarp))
+          srcExtractHardware.push_back({kWarp, warp});
+        if (srcMappingLL.hasInDim(kBlock))
+          srcExtractHardware.push_back({kBlock, 0});
+        auto elemCoords = srcMappingLL.apply(srcExtractHardware);
         for (auto [dim, offset] : llvm::enumerate(offsets))
           elemCoords[dim].second += offset;
+        for (auto [dim, size] : llvm::enumerate(srcShape)) {
+          if (elemCoords[dim].second < 0 || elemCoords[dim].second >= size) {
+            return emitError("result coordinates must stay within the source "
+                             "tensor");
+          }
+        }
 
         std::optional<int32_t> srcReg =
             getRegisterIdForThread(srcLL, elemCoords, lane, warp, ctx);

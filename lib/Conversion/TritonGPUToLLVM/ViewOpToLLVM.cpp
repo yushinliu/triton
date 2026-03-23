@@ -316,9 +316,16 @@ struct ExtractTensorOpConversion
 
     auto srcLL = toLinearLayout(srcTy);
     auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
-    auto srcReplicaLL = getReplicaLinearLayout(srcTy).transposeOuts(outDimNames);
     auto replicaShape = getShapePerCTATile(srcTy);
     auto dstLL = toLinearLayout(dstTy).transposeOuts(outDimNames);
+    SmallVector<int64_t> coverageShape;
+    coverageShape.reserve(srcTy.getRank());
+    for (auto [replicaDim, resultDim] :
+         llvm::zip_equal(replicaShape, dstTy.getShape())) {
+      coverageShape.push_back(std::max<int64_t>(replicaDim, resultDim));
+    }
+    auto srcMappingLL =
+        getExtractTensorLinearLayout(srcTy, coverageShape).transposeOuts(outDimNames);
 
     SmallVector<int32_t> offsets;
     offsets.reserve(replicaShape.size());
@@ -337,16 +344,16 @@ struct ExtractTensorOpConversion
     SmallVector<int32_t> srcRegForDstReg;
     srcRegForDstReg.reserve(dstRegCount);
     for (int regId = 0; regId < dstRegCount; ++regId) {
-      SmallVector<std::pair<StringAttr, int32_t>> srcReplicaHardware = {
+      SmallVector<std::pair<StringAttr, int32_t>> srcExtractHardware = {
           {kReg, regId}};
-      if (srcReplicaLL.hasInDim(kLane))
-        srcReplicaHardware.push_back({kLane, 0});
-      if (srcReplicaLL.hasInDim(kWarp))
-        srcReplicaHardware.push_back({kWarp, 0});
-      if (srcReplicaLL.hasInDim(kBlock))
-        srcReplicaHardware.push_back({kBlock, 0});
+      if (srcMappingLL.hasInDim(kLane))
+        srcExtractHardware.push_back({kLane, 0});
+      if (srcMappingLL.hasInDim(kWarp))
+        srcExtractHardware.push_back({kWarp, 0});
+      if (srcMappingLL.hasInDim(kBlock))
+        srcExtractHardware.push_back({kBlock, 0});
 
-      auto srcElemCoords = srcReplicaLL.apply(srcReplicaHardware);
+      auto srcElemCoords = srcMappingLL.apply(srcExtractHardware);
       for (auto [dim, offset] : llvm::enumerate(offsets))
         srcElemCoords[dim].second += offset;
 

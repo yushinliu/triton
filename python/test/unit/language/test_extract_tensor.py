@@ -1,28 +1,29 @@
+import ast
+import functools
 import pathlib
 
 import pytest
 import torch
 
 import triton
+from triton._C.libtriton import gluon_ir, ir
+from triton.experimental.gluon import language as ttgl
+from triton.tools import LinearLayout
 
 
 def _blocked_layout_for_warp_size(threads_per_warp: int):
     if threads_per_warp == 32:
-        return "[4, 8]", "[8, 1]", 8
+        return [4, 8], [8, 1], 8
     if threads_per_warp == 64:
-        return "[8, 8]", "[4, 1]", 4
+        return [8, 8], [4, 1], 4
     pytest.skip(f"unsupported warp size {threads_per_warp}")
-
-
-def _expected_contiguous(x: torch.Tensor, expected_slice):
-    return x[expected_slice].clone()
 
 
 def _blocked2_threads_per_warp_layout(threads_per_warp: int):
     if threads_per_warp == 32:
-        return "[8, 4]"
+        return [8, 4]
     if threads_per_warp == 64:
-        return "[16, 4]"
+        return [16, 4]
     pytest.skip(f"unsupported warp size {threads_per_warp}")
 
 
@@ -51,33 +52,161 @@ def _expected_blocked2(x: torch.Tensor, threads_per_warp: int):
     return expected
 
 
+def _format_layout(values):
+    return "[" + ", ".join(str(v) for v in values) + "]"
+
+
+@functools.lru_cache(maxsize=None)
+def _linear_layout(shape, size_per_thread, threads_per_warp, warps_per_cta):
+    ctx = ir.context()
+    ir.load_dialects(ctx)
+    builder = gluon_ir.GluonOpBuilder(ctx)
+    layout = ttgl.BlockedLayout(list(size_per_thread), list(threads_per_warp),
+                                list(warps_per_cta), [1, 0])
+    linear = builder.to_linear_layout(layout._to_ir(builder), list(shape))
+    return LinearLayout.from_bases(
+        [
+            ("register", linear.reg_bases),
+            ("lane", linear.lane_bases),
+            ("warp", linear.warp_bases),
+            ("block", linear.block_bases),
+        ],
+        ["dim0", "dim1"],
+        list(shape),
+        require_surjective=True,
+    )
+
+
+def _extract_linear_layout(layout, extracted_shape):
+    updated_bases = []
+    for in_dim, bases in layout.bases:
+        truncated_bases = []
+        for basis in bases:
+            truncated = [
+                0 if basis[dim] >= extracted_shape[dim] else basis[dim]
+                for dim in range(len(extracted_shape))
+            ]
+            if in_dim == "register" and all(value == 0 for value in truncated):
+                continue
+            truncated_bases.append(truncated)
+        updated_bases.append((in_dim, truncated_bases))
+    return LinearLayout.from_bases(
+        updated_bases,
+        layout.get_out_dim_names(),
+        list(extracted_shape),
+        require_surjective=False,
+    )
+
+
+def _in_dim_size(layout, dim_name):
+    bases = dict(layout.bases)
+    return 1 << len(bases.get(dim_name, []))
+
+
+def _get_register_id_from_coords(layout, coords):
+    hardware = layout.pseudoinvert().apply({"dim0": coords[0], "dim1": coords[1]})
+    reg = hardware.get("register")
+    for dim_name, value in hardware.items():
+        if dim_name != "register" and value != 0:
+            raise AssertionError(f"non-static source mapping for {coords}: {hardware}")
+    return reg
+
+
+def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shape,
+                             result_size_per_thread,
+                             result_threads_per_warp_layout):
+    src_shape = (128, 128)
+    src_size_per_thread = (1, 4)
+    src_threads_per_warp, warps_per_cta, _ = _blocked_layout_for_warp_size(
+        threads_per_warp)
+    replica_shape = tuple(
+        size * threads * warps for size, threads, warps in zip(
+            src_size_per_thread, src_threads_per_warp, warps_per_cta))
+    coverage_shape = tuple(
+        max(replica_dim, result_dim)
+        for replica_dim, result_dim in zip(replica_shape, result_shape))
+    offsets = (replica_shape[0], 2 * replica_shape[1])
+
+    src_layout = _linear_layout(src_shape, src_size_per_thread,
+                                tuple(src_threads_per_warp),
+                                tuple(warps_per_cta))
+    dst_layout = _linear_layout(result_shape, result_size_per_thread,
+                                tuple(result_threads_per_warp_layout),
+                                tuple(warps_per_cta))
+    extracted_layout = _extract_linear_layout(src_layout, coverage_shape)
+    src_reg_for_dst_reg = []
+    for reg in range(_in_dim_size(dst_layout, "register")):
+        src_coords = extracted_layout.apply({
+            "register": reg,
+            "lane": 0,
+            "warp": 0,
+            "block": 0,
+        })
+        src_reg_for_dst_reg.append(
+            _get_register_id_from_coords(
+                src_layout,
+                (src_coords["dim0"] + offsets[0], src_coords["dim1"] + offsets[1]),
+            ))
+
+    expected = torch.empty(result_shape, device=x.device, dtype=x.dtype)
+    visited = torch.zeros(result_shape, device=x.device, dtype=torch.bool)
+    for warp in range(_in_dim_size(dst_layout, "warp")):
+        for lane in range(_in_dim_size(dst_layout, "lane")):
+            for reg in range(_in_dim_size(dst_layout, "register")):
+                hardware_point = {
+                    "register": reg,
+                    "lane": lane,
+                    "warp": warp,
+                    "block": 0,
+                }
+                dst_coords = dst_layout.apply(hardware_point)
+                src_coords = src_layout.apply({
+                    "register": src_reg_for_dst_reg[reg],
+                    "lane": lane,
+                    "warp": warp,
+                    "block": 0,
+                })
+                dst_row, dst_col = dst_coords["dim0"], dst_coords["dim1"]
+                src_row, src_col = src_coords["dim0"], src_coords["dim1"]
+
+                value = x[src_row, src_col]
+                if visited[dst_row, dst_col].item():
+                    assert torch.equal(expected[dst_row, dst_col], value)
+                    continue
+                expected[dst_row, dst_col] = value
+                visited[dst_row, dst_col] = True
+
+    assert torch.all(visited).item()
+    return expected
+
+
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize(
-    "result_shape, result_size_per_thread, result_threads_per_warp_layout, "
-    "expected_fn, expected_slice",
+    "result_shape, result_size_per_thread, result_layout_kind",
     [
-        ((32, 32), "[1, 4]", None, _expected_contiguous,
-         (slice(32, 64), slice(64, 96))),
-        ((32, 16), "[1, 2]", None, _expected_blocked2, None),
+        ((32, 32), "[1, 4]", "same"),
+        ((64, 32), "[1, 4]", "same"),
+        ((32, 16), "[1, 2]", "same"),
+        ((64, 16), "[1, 2]", "same"),
+        ((32, 16), "[1, 2]", "blocked2"),
     ],
 )
 def test_extract_tensor_ttgir(dtype, result_shape, result_size_per_thread,
-                              result_threads_per_warp_layout, expected_fn,
-                              expected_slice, tmp_path: pathlib.Path, device):
+                              result_layout_kind, tmp_path: pathlib.Path,
+                              device):
     current_target = triton.runtime.driver.active.get_current_target()
     threads_per_warp = current_target.warp_size
     threads_per_warp_layout, warps_per_cta, num_warps = \
         _blocked_layout_for_warp_size(threads_per_warp)
     result_m, result_n = result_shape
-    if expected_fn is _expected_blocked2:
+    if result_layout_kind == "blocked2":
         result_tpw_layout = _blocked2_threads_per_warp_layout(threads_per_warp)
     else:
-        result_tpw_layout = result_threads_per_warp_layout or \
-            threads_per_warp_layout
+        result_tpw_layout = threads_per_warp_layout
 
     ir = f"""
-    #src_blocked = #ttg.blocked<{{sizePerThread = [1, 4], threadsPerWarp = {threads_per_warp_layout}, warpsPerCTA = {warps_per_cta}, order = [1, 0]}}>
-    #dst_blocked = #ttg.blocked<{{sizePerThread = {result_size_per_thread}, threadsPerWarp = {result_tpw_layout}, warpsPerCTA = {warps_per_cta}, order = [1, 0]}}>
+    #src_blocked = #ttg.blocked<{{sizePerThread = [1, 4], threadsPerWarp = {_format_layout(threads_per_warp_layout)}, warpsPerCTA = {_format_layout(warps_per_cta)}, order = [1, 0]}}>
+    #dst_blocked = #ttg.blocked<{{sizePerThread = {result_size_per_thread}, threadsPerWarp = {_format_layout(result_tpw_layout)}, warpsPerCTA = {_format_layout(warps_per_cta)}, order = [1, 0]}}>
 
     module attributes {{"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = {num_warps} : i32, "ttg.threads-per-warp" = {threads_per_warp} : i32}} {{
       tt.func public @kernel(%arg0: !tt.ptr<f16> {{tt.divisibility = 16 : i32}}, %arg1: !tt.ptr<f16> {{tt.divisibility = 16 : i32}}) {{
@@ -122,10 +251,14 @@ def test_extract_tensor_ttgir(dtype, result_shape, result_size_per_thread,
     y = torch.empty(result_shape, device=device, dtype=dtype)
 
     kernel[(1, 1, 1)](x.data_ptr(), y.data_ptr())
-    if expected_slice is not None:
-        expected = expected_fn(x, expected_slice)
-    elif expected_fn is _expected_blocked2:
-        expected = expected_fn(x, threads_per_warp)
+    if result_layout_kind == "blocked2":
+        expected = _expected_blocked2(x, threads_per_warp)
     else:
-        expected = expected_fn(x)
+        expected = _expected_extract_tensor(
+            x,
+            threads_per_warp,
+            result_shape,
+            tuple(ast.literal_eval(result_size_per_thread)),
+            tuple(result_tpw_layout),
+        )
     assert torch.equal(y, expected)

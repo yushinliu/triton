@@ -329,29 +329,43 @@ SmallVector<int64_t> getShapePerCTA(Type type) {
 LinearLayout getReplicaLinearLayout(RankedTensorType type) {
   auto ll = toLinearLayout(type);
   auto llEnc = toLinearEncoding(type);
-  auto outDims = ll.getOutDims();
 
   SmallVector<unsigned> replicaShape;
-  replicaShape.reserve(outDims.size());
+  replicaShape.reserve(type.getRank());
   for (auto [size, thread, warp] : llvm::zip_equal(
            llEnc.getSizePerThread(), llEnc.getThreadsPerWarp(),
            llEnc.getWarpsPerCTA())) {
     replicaShape.push_back(size * thread * warp);
   }
 
+  return getExtractTensorLinearLayout(
+      type, llvm::to_vector(llvm::map_range(replicaShape, [](unsigned dimSize) {
+              return static_cast<int64_t>(dimSize);
+            })));
+}
+
+LinearLayout getExtractTensorLinearLayout(RankedTensorType type,
+                                          ArrayRef<int64_t> shape) {
+  auto ll = toLinearLayout(type);
+  auto outDims = ll.getOutDims();
   auto replicaBases = ll.getBases();
-  for (auto [dim, replicaDimSize] :
-       llvm::zip_equal(llvm::seq<size_t>(0, replicaShape.size()),
-                       replicaShape)) {
+  auto kReg = StringAttr::get(type.getContext(), "register");
+  for (auto [dim, dimSize] :
+       llvm::zip_equal(llvm::seq<size_t>(0, shape.size()), shape)) {
     for (auto &[inDim, inDimBases] : replicaBases) {
       (void)inDim;
       for (auto &basis : inDimBases) {
-        if (basis[dim] >= static_cast<int32_t>(replicaDimSize))
+        if (basis[dim] >= static_cast<int32_t>(dimSize))
           basis[dim] = 0;
       }
     }
-    outDims[dim].second = replicaDimSize;
+    outDims[dim].second = static_cast<int32_t>(dimSize);
   }
+
+  auto &regBases = replicaBases[kReg];
+  llvm::erase_if(regBases, [](ArrayRef<int32_t> basis) {
+    return llvm::all_of(basis, [](int32_t coord) { return coord == 0; });
+  });
 
   return LinearLayout(replicaBases, outDims, /*requireSurjective=*/false);
 }

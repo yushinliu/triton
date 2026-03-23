@@ -232,6 +232,8 @@ SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape);
 SmallVector<int64_t> getShapePerCTA(Type type);
 SmallVector<int64_t> getShapePerCTATile(RankedTensorType type);
 
+LinearLayout getExtractTensorLinearLayout(RankedTensorType type,
+                                          ArrayRef<int64_t> shape);
 LinearLayout getReplicaLinearLayout(RankedTensorType type);
 ElemCoord getElemCoordinatesFromRegisterId(const LinearLayout &layout,
                                            unsigned regId,
