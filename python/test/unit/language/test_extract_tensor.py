@@ -18,11 +18,29 @@ def _expected_contiguous(x: torch.Tensor, expected_slice):
     return x[expected_slice].clone()
 
 
-def _expected_blocked2_warp32(x: torch.Tensor):
+def _blocked2_threads_per_warp_layout(threads_per_warp: int):
+    if threads_per_warp == 32:
+        return "[8, 4]"
+    if threads_per_warp == 64:
+        return "[16, 4]"
+    pytest.skip(f"unsupported warp size {threads_per_warp}")
+
+
+def _expected_blocked2(x: torch.Tensor, threads_per_warp: int):
+    if threads_per_warp == 32:
+        rows_per_unique_warp = 8
+        src_rows_per_warp = 4
+    elif threads_per_warp == 64:
+        rows_per_unique_warp = 16
+        src_rows_per_warp = 8
+    else:
+        pytest.skip(f"unsupported warp size {threads_per_warp}")
+
     expected = torch.empty((32, 16), device=x.device, dtype=x.dtype)
     for dst_row in range(32):
-        row_in_warp = dst_row % 8
-        src_row = 32 + 4 * (dst_row // 8) + row_in_warp // 2
+        row_in_warp = dst_row % rows_per_unique_warp
+        src_row = (32 + src_rows_per_warp * (dst_row // rows_per_unique_warp) +
+                   row_in_warp // 2)
         for dst_col in range(16):
             group = dst_col // 8
             within_group = dst_col % 8
@@ -40,7 +58,7 @@ def _expected_blocked2_warp32(x: torch.Tensor):
     [
         ((32, 32), "[1, 4]", None, _expected_contiguous,
          (slice(32, 64), slice(64, 96))),
-        ((32, 16), "[1, 2]", "[8, 4]", _expected_blocked2_warp32, None),
+        ((32, 16), "[1, 2]", None, _expected_blocked2, None),
     ],
 )
 def test_extract_tensor_ttgir(dtype, result_shape, result_size_per_thread,
@@ -50,11 +68,12 @@ def test_extract_tensor_ttgir(dtype, result_shape, result_size_per_thread,
     threads_per_warp = current_target.warp_size
     threads_per_warp_layout, warps_per_cta, num_warps = \
         _blocked_layout_for_warp_size(threads_per_warp)
-    if expected_fn is _expected_blocked2_warp32 and threads_per_warp != 32:
-        pytest.skip("32x16 blocked2 extract test currently covers warp_size=32")
     result_m, result_n = result_shape
-    result_tpw_layout = result_threads_per_warp_layout or \
-        threads_per_warp_layout
+    if expected_fn is _expected_blocked2:
+        result_tpw_layout = _blocked2_threads_per_warp_layout(threads_per_warp)
+    else:
+        result_tpw_layout = result_threads_per_warp_layout or \
+            threads_per_warp_layout
 
     ir = f"""
     #src_blocked = #ttg.blocked<{{sizePerThread = [1, 4], threadsPerWarp = {threads_per_warp_layout}, warpsPerCTA = {warps_per_cta}, order = [1, 0]}}>
@@ -105,6 +124,8 @@ def test_extract_tensor_ttgir(dtype, result_shape, result_size_per_thread,
     kernel[(1, 1, 1)](x.data_ptr(), y.data_ptr())
     if expected_slice is not None:
         expected = expected_fn(x, expected_slice)
+    elif expected_fn is _expected_blocked2:
+        expected = expected_fn(x, threads_per_warp)
     else:
         expected = expected_fn(x)
     assert torch.equal(y, expected)
