@@ -5,6 +5,22 @@ This note explains how `ExtractTensorOpConversion` in
 to a pure static register remap, using the test cases in
 `python/test/unit/language/test_extract_tensor.py`.
 
+The current test file covers these representative cases:
+
+1. `coords=[1,2]`, `dst=32x32`, same blocked layout
+2. `coords=[1,2]`, `dst=64x32`, same blocked layout
+3. `coords=[1,4]`, `dst=32x16`, same thread/warp layout with smaller `sizePerThread`
+4. `coords=[1,4]`, `dst=64x16`, same thread/warp layout with smaller `sizePerThread`
+5. `coords=[1,4]`, `dst=32x16`, `blocked2` reinterpretation
+6. `order=[0,1]`, `coords=[1,2]`, `dst=32x32`, same blocked layout with `sizePerThread=[4,1]`
+7. `order=[0,1]`, `coords=[1,1]`, `dst=32x64`, same blocked layout with `sizePerThread=[4,1]`
+8. `order=[0,1]`, `coords=[2,2]`, `dst=16x32`, same blocked layout with `sizePerThread=[2,1]`
+9. `order=[0,1]`, `coords=[2,1]`, `dst=16x64`, same blocked layout with `sizePerThread=[2,1]`
+
+This document explains the common lowering algorithm first, then uses case 2,
+case 3, and case 5 as concrete examples. Case 1 is the degenerate single-tile
+form of case 2, and case 4 is the multi-tile form of case 3.
+
 The important constraint is that this lowering does not generate extra LLVM IR
 to compute indices at runtime. After the source tensor has been unpacked to
 `srcVals`, the lowering only does:
@@ -58,6 +74,177 @@ That gives a compile-time array:
 srcRegForDstReg[regId] = source register index
 ```
 
+### 2.1 How `srcMappingLL -> srcRegForDstReg -> ret` fits together
+
+This is the core dataflow of the lowering.
+
+`srcMappingLL` does not describe the final result layout. It describes the
+logical coordinates exposed by the extracted source span. For a destination
+register id `regId`, the lowering first asks:
+
+```text
+srcElemCoords = srcMappingLL(register=regId, lane=0, warp=0, block=0)
+```
+
+Then it shifts those coordinates by the tile offsets:
+
+```text
+srcElemCoords[dim] += coords[dim] * dstShape[dim]
+```
+
+At that point `srcElemCoords` is a logical coordinate inside the original
+source tensor. The lowering then asks `srcLL` which source register owns that
+logical element:
+
+```text
+srcRegForDstReg[regId] = getRegisterIdFromCoordinates(srcLL, srcElemCoords)
+```
+
+This produces a compile-time table from destination registers to source
+registers.
+
+Finally, lowering materializes the LLVM value for the result in two steps:
+
+```text
+resultVals[regId] = srcVals[srcRegForDstReg[regId]]
+ret = packLLElements(resultVals, dstTy)
+```
+
+So the chain is:
+
+```text
+srcMappingLL
+  -> logical source coordinates for each destination register
+  -> srcRegForDstReg
+  -> resultVals
+  -> ret
+```
+
+This is why the LLVM lowering stays static. `srcMappingLL` and
+`srcRegForDstReg` are both compile-time objects, and `ret` is built only by
+reordering unpacked source registers and repacking them under `dstTy`.
+
+### 2.2 Two End-to-End Examples
+
+The easiest way to read the lowering is to follow the same three objects in
+two different test cases:
+
+- Example A: `64x32` same-layout extraction
+- Example C: `32x16 -> blocked2` reinterpretation
+
+They share the same pipeline:
+
+```text
+srcMappingLL
+  -> which logical source element does dst register regId want?
+  -> srcRegForDstReg
+  -> which physical source register already holds that element?
+  -> ret
+  -> pack those chosen source registers under dstLL
+```
+
+#### Example A: `64x32` same-layout extraction
+
+From Example A below:
+
+- `coverageShape = [64, 32]`
+- `offsets = [64, 64]`
+- `dstRegCount = 8`
+
+`srcMappingLL` is the clipped source extraction layout for `[64,32]`. For a
+few destination registers:
+
+```text
+regId = 0: srcMappingLL(reg=0,lane=0,warp=0) = [0, 0]
+regId = 1: srcMappingLL(reg=1,lane=0,warp=0) = [0, 1]
+regId = 4: srcMappingLL(reg=4,lane=0,warp=0) = [32, 0]
+```
+
+After adding tile offsets:
+
+```text
+regId = 0: [0, 0]   + [64, 64] = [64, 64]
+regId = 1: [0, 1]   + [64, 64] = [64, 65]
+regId = 4: [32, 0]  + [64, 64] = [96, 64]
+```
+
+Then `srcLL` resolves those logical coordinates back to concrete source
+register ids:
+
+```text
+regId = 0 -> srcRegForDstReg[0] = 40
+regId = 1 -> srcRegForDstReg[1] = 41
+regId = 4 -> srcRegForDstReg[4] = 56
+```
+
+So the full mapping is:
+
+```text
+srcRegForDstReg = [40, 41, 42, 43, 56, 57, 58, 59]
+```
+
+At LLVM lowering time, `srcVals` is the unpacked source register vector. The
+result is materialized as:
+
+```text
+resultVals = [
+  srcVals[40], srcVals[41], srcVals[42], srcVals[43],
+  srcVals[56], srcVals[57], srcVals[58], srcVals[59],
+]
+ret = packLLElements(resultVals, dstTy)
+```
+
+Because `dstLL` matches the extracted source layout in this example, `ret`
+represents a straightforward two-replica extraction along `dim0`.
+
+#### Example C: `32x16 -> blocked2` reinterpretation
+
+From Example C below:
+
+- `coverageShape = [32, 32]`
+- `offsets = [32, 64]`
+- `dstRegCount = 2`
+
+Here `srcMappingLL` is still the full single-replica source extraction layout,
+so for the two destination registers:
+
+```text
+regId = 0: srcMappingLL(reg=0,lane=0,warp=0) = [0, 0]
+regId = 1: srcMappingLL(reg=1,lane=0,warp=0) = [0, 1]
+```
+
+After adding offsets:
+
+```text
+regId = 0: [0, 0] + [32, 64] = [32, 64]
+regId = 1: [0, 1] + [32, 64] = [32, 65]
+```
+
+Then `srcLL` resolves those coordinates:
+
+```text
+srcRegForDstReg = [24, 25]
+```
+
+So lowering again builds:
+
+```text
+resultVals = [srcVals[24], srcVals[25]]
+ret = packLLElements(resultVals, dstTy)
+```
+
+The key difference from Example A is the last line. In Example C, `dstTy` uses
+the `blocked2` destination layout, so `packLLElements` reinterprets the same
+two source registers under a different `dstLL`. In other words:
+
+- `srcMappingLL` decides which source elements are requested
+- `srcRegForDstReg` decides which source registers contain them
+- `ret` gets its final logical coordinates only when those registers are packed
+  with the destination layout
+
+That is why Example C changes the visible logical placement of values without
+changing which source registers are read.
+
 ### 3. Emit only static register moves
 
 The lowering never builds extra arithmetic/select IR for the remap. It only
@@ -69,6 +256,12 @@ resultVals[regId] = srcVals[srcRegForDstReg[regId]]
 
 Then it calls `packLLElements(..., dstTy)` so the same local register vector is
 reinterpreted under the destination layout.
+
+The important detail is that `ret` is not created directly from
+`srcMappingLL`. `srcMappingLL` only tells us which logical source element each
+destination register wants. `srcRegForDstReg` converts that logical request
+into a concrete source register index, and `packLLElements(..., dstTy)` is what
+finally gives those reordered registers the destination layout meaning.
 
 ## GF(2) Table Convention
 
@@ -191,6 +384,42 @@ srcRegForDstReg = [40, 41, 42, 43, 56, 57, 58, 59]
 
 This is why `64x32` really spans two source replicas along `dim0` instead of
 duplicating the first `32x32` tile.
+
+## Example A': `128x128 -> 64x16`, Same Layout Family with Smaller `sizePerThread`
+
+This is test case 4:
+
+```text
+src: tensor<128x128xf16, blocked<[1,4],[4,8],[8,1]>>
+dst: tensor<64x16xf16,  blocked<[1,2],[4,8],[8,1]>>
+coords = [1, 4]
+```
+
+So:
+
+- `replicaShape = [32, 32]`
+- `coverageShape = [64, 32]`
+- `offsets = [64, 64]`
+
+This case combines the two mechanisms that matter in this lowering:
+
+- `64` rows means the source-side extraction span must cover two source replicas
+  along `dim0`
+- `16` columns with `sizePerThread=[1,2]` means the destination consumes fewer
+  destination registers than the source-side extraction span exposes
+
+The lowering still follows the same steps:
+
+1. Build `srcLL`
+2. Build `srcMappingLL` for `coverageShape=[64,32]`
+3. Build `dstLL` for `64x16`
+4. Compute a static `srcRegForDstReg`
+5. Re-pack those source registers using the destination layout
+
+The key point is that `coverageShape` is driven by the source span needed to
+derive the mapping, while `dstRegCount` is driven by the actual destination
+layout. So this case is "multi-replica" on the source side, but still "partial
+register-vector" on the destination side.
 
 ## Example B: `128x128 -> 32x16`, Same Layout but Smaller `sizePerThread`
 

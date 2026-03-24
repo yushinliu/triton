@@ -232,12 +232,25 @@ SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape);
 SmallVector<int64_t> getShapePerCTA(Type type);
 SmallVector<int64_t> getShapePerCTATile(RankedTensorType type);
 
+// Builds the source-side extraction layout used by ExtractTensorOp.
+// The returned layout keeps the source lane/warp bases unchanged and clips the
+// output domain to `shape`; dead register bases are dropped so the layout
+// stays faithful to the extracted source span.
 LinearLayout getExtractTensorLinearLayout(RankedTensorType type,
                                           ArrayRef<int64_t> shape);
+
+// Returns the single-replica layout for `type`, expressed as a clipped source
+// layout with the same hardware participation as the original tensor.
 LinearLayout getReplicaLinearLayout(RankedTensorType type);
+
+// Maps a register id to the logical element coordinates owned by register/lane
+// 0/warp 0 in `layout`.
 ElemCoord getElemCoordinatesFromRegisterId(const LinearLayout &layout,
                                            unsigned regId,
                                            MLIRContext *ctx);
+
+// Finds the source register that owns `coordinates` when lane/warp/block are
+// fixed to zero.
 std::optional<int> getRegisterIdFromCoordinates(const LinearLayout &layout,
                                                 ElemCoord coordinates,
                                                 MLIRContext *ctx);

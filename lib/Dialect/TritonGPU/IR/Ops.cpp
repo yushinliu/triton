@@ -47,6 +47,10 @@ static std::string stringifyElemCoord(mlir::triton::gpu::ElemCoord coords) {
   return result;
 }
 
+// Resolves which source register owns `coordinates` for a fixed lane/warp
+// instance. ExtractTensorOp uses this in the verifier to prove that every
+// destination register can be served by a single source register without any
+// lane- or warp-dependent remapping.
 static std::optional<int32_t>
 getRegisterIdForThread(const mlir::triton::LinearLayout &layout,
                        mlir::triton::gpu::ElemCoord coordinates, int32_t lane,
@@ -74,6 +78,8 @@ getRegisterIdForThread(const mlir::triton::LinearLayout &layout,
                                                          ctx);
 }
 
+// Accepts either a plain ranked tensor or a tensor pointer whose pointee is a
+// ranked tensor. ExtractTensorOp verifies both forms in the same way.
 static mlir::RankedTensorType getExtractTensorType(mlir::Type type) {
   if (auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(type))
     return tensorTy;
@@ -88,6 +94,8 @@ static mlir::RankedTensorType getExtractTensorType(mlir::Type type) {
 namespace mlir::triton::gpu {
 
 LogicalResult ExtractTensorOp::verify() {
+  // ExtractTensorOp is valid only when the extraction can be expressed as a
+  // static register remap inside the original lane/warp topology.
   Type srcType = getSrc().getType();
   Type dstType = getResult().getType();
   bool srcIsTensorPtr = isa<triton::PointerType>(srcType);
@@ -125,6 +133,9 @@ LogicalResult ExtractTensorOp::verify() {
        llvm::zip_equal(replicaShape, dstTy.getShape())) {
     coverageShape.push_back(std::max<int64_t>(replicaDim, resultDim));
   }
+  // `srcMappingLL` describes the source-side span that needs to be visible to
+  // derive the remap. It may be larger than the final result shape when the
+  // destination spans multiple replicas.
   auto srcMappingLL =
       getExtractTensorLinearLayout(srcTy, coverageShape).transposeOuts(outDimNames);
 
@@ -173,6 +184,9 @@ LogicalResult ExtractTensorOp::verify() {
     return emitError("result register count cannot exceed the extracted source "
                      "register count");
   }
+  // For each destination register, verify that every participating lane/warp
+  // resolves to the same source register after applying the source extraction
+  // layout and tile offsets.
   for (int regId = 0; regId < dstRegCount; ++regId) {
     std::optional<int32_t> representativeSrcReg;
     for (int lane = 0; lane < laneCount; ++lane) {

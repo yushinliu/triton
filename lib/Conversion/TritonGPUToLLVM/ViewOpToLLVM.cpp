@@ -304,6 +304,13 @@ struct ExtractTensorOpConversion
   LogicalResult
   matchAndRewrite(ExtractTensorOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // Lower ExtractTensorOp as a compile-time register remap:
+    // 1. derive a source-side extraction layout (`srcMappingLL`)
+    // 2. compute a static dst-register -> src-register table
+    // 3. reorder unpacked source registers and repack them as the dst layout
+    //
+    // No data-dependent index arithmetic or cross-thread exchange is emitted
+    // here; the verifier guarantees this remap is legal.
     Location loc = op.getLoc();
     auto srcTy = dyn_cast<RankedTensorType>(op.getSrc().getType());
     auto dstTy = dyn_cast<RankedTensorType>(op.getType());
@@ -324,6 +331,8 @@ struct ExtractTensorOpConversion
          llvm::zip_equal(replicaShape, dstTy.getShape())) {
       coverageShape.push_back(std::max<int64_t>(replicaDim, resultDim));
     }
+    // `srcMappingLL` models the logical coordinates exposed by the extracted
+    // source span before tile offsets are applied.
     auto srcMappingLL =
         getExtractTensorLinearLayout(srcTy, coverageShape).transposeOuts(outDimNames);
 
@@ -339,6 +348,9 @@ struct ExtractTensorOpConversion
     auto kBlock = StringAttr::get(ctx, "block");
     int dstRegCount = dstLL.getInDimSize(kReg);
 
+    // Collapse the source extraction layout into a single source register id
+    // for each destination register. The verifier has already proven that
+    // lane/warp do not change this mapping, so lane=warp=0 is sufficient here.
     SmallVector<int32_t> srcRegForDstReg;
     srcRegForDstReg.reserve(dstRegCount);
     for (int regId = 0; regId < dstRegCount; ++regId) {
@@ -363,6 +375,9 @@ struct ExtractTensorOpConversion
       srcRegForDstReg.push_back(*srcReg);
     }
 
+    // Materialize the final register vector by pure index selection from the
+    // unpacked source registers, then reinterpret that vector with the dst
+    // layout through packLLElements.
     SmallVector<Value> resultVals;
     resultVals.reserve(dstRegCount);
     for (int regId = 0; regId < dstRegCount; ++regId) {

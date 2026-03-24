@@ -346,6 +346,10 @@ LinearLayout getReplicaLinearLayout(RankedTensorType type) {
 
 LinearLayout getExtractTensorLinearLayout(RankedTensorType type,
                                           ArrayRef<int64_t> shape) {
+  // Start from the full source layout and clip every output basis that lands
+  // outside the extracted source span. Register bases that become all-zero are
+  // removed so the resulting layout exposes exactly the registers that may
+  // contribute values to ExtractTensorOp.
   auto ll = toLinearLayout(type);
   auto outDims = ll.getOutDims();
   auto replicaBases = ll.getBases();

@@ -11,11 +11,17 @@ from triton.experimental.gluon import language as ttgl
 from triton.tools import LinearLayout
 
 
-def _blocked_layout_for_warp_size(threads_per_warp: int):
-    if threads_per_warp == 32:
-        return [4, 8], [8, 1], 8
-    if threads_per_warp == 64:
-        return [8, 8], [4, 1], 4
+def _blocked_layout_for_warp_size(threads_per_warp: int, order):
+    if order == (1, 0):
+        if threads_per_warp == 32:
+            return [1, 4], [4, 8], [8, 1], 8
+        if threads_per_warp == 64:
+            return [1, 4], [8, 8], [4, 1], 4
+    if order == (0, 1):
+        if threads_per_warp == 32:
+            return [4, 1], [8, 4], [1, 8], 8
+        if threads_per_warp == 64:
+            return [4, 1], [8, 8], [1, 4], 4
     pytest.skip(f"unsupported warp size {threads_per_warp}")
 
 
@@ -58,13 +64,18 @@ def _format_layout(values):
     return "[" + ", ".join(str(v) for v in values) + "]"
 
 
+def _format_order(values):
+    return "[" + ", ".join(str(v) for v in values) + "]"
+
+
 @functools.lru_cache(maxsize=None)
-def _linear_layout(shape, size_per_thread, threads_per_warp, warps_per_cta):
+def _linear_layout(shape, size_per_thread, threads_per_warp, warps_per_cta,
+                   order):
     ctx = ir.context()
     ir.load_dialects(ctx)
     builder = gluon_ir.GluonOpBuilder(ctx)
     layout = ttgl.BlockedLayout(list(size_per_thread), list(threads_per_warp),
-                                list(warps_per_cta), [1, 0])
+                                list(warps_per_cta), list(order))
     linear = builder.to_linear_layout(layout._to_ir(builder), list(shape))
     return LinearLayout.from_bases(
         [
@@ -115,12 +126,14 @@ def _get_register_id_from_coords(layout, coords):
 
 
 def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shape,
-                             coords, result_size_per_thread,
+                             coords, src_order, result_size_per_thread,
                              result_threads_per_warp_layout):
     src_shape = (128, 128)
-    src_size_per_thread = (1, 4)
-    src_threads_per_warp, warps_per_cta, _ = _blocked_layout_for_warp_size(
-        threads_per_warp)
+    src_size_per_thread, src_threads_per_warp, warps_per_cta, _ = \
+        _blocked_layout_for_warp_size(threads_per_warp, src_order)
+    src_size_per_thread = tuple(src_size_per_thread)
+    src_threads_per_warp = tuple(src_threads_per_warp)
+    warps_per_cta = tuple(warps_per_cta)
     replica_shape = tuple(
         size * threads * warps for size, threads, warps in zip(
             src_size_per_thread, src_threads_per_warp, warps_per_cta))
@@ -131,11 +144,11 @@ def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shap
         coord * size for coord, size in zip(coords, result_shape))
 
     src_layout = _linear_layout(src_shape, src_size_per_thread,
-                                tuple(src_threads_per_warp),
-                                tuple(warps_per_cta))
+                                src_threads_per_warp, warps_per_cta,
+                                tuple(src_order))
     dst_layout = _linear_layout(result_shape, result_size_per_thread,
                                 tuple(result_threads_per_warp_layout),
-                                tuple(warps_per_cta))
+                                tuple(warps_per_cta), tuple(src_order))
     extracted_layout = _extract_linear_layout(src_layout, coverage_shape)
     src_reg_for_dst_reg = []
     for reg in range(_in_dim_size(dst_layout, "register")):
@@ -186,31 +199,38 @@ def _expected_extract_tensor(x: torch.Tensor, threads_per_warp: int, result_shap
 
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize(
-    "coords, result_shape, result_size_per_thread, result_layout_kind",
+    "coords, result_shape, result_size_per_thread, result_layout_kind, order",
     [
-        ("[1, 2]", (32, 32), "[1, 4]", "same"),
-        ("[1, 2]", (64, 32), "[1, 4]", "same"),
-        ("[1, 4]", (32, 16), "[1, 2]", "same"),
-        ("[1, 4]", (64, 16), "[1, 2]", "same"),
-        ("[1, 4]", (32, 16), "[1, 2]", "blocked2"),
+        ("[1, 2]", (32, 32), "[1, 4]", "same", "[1, 0]"),
+        ("[1, 2]", (64, 32), "[1, 4]", "same", "[1, 0]"),
+        ("[1, 4]", (32, 16), "[1, 2]", "same", "[1, 0]"),
+        ("[1, 4]", (64, 16), "[1, 2]", "same", "[1, 0]"),
+        ("[1, 4]", (32, 16), "[1, 2]", "blocked2", "[1, 0]"),
+        ("[1, 2]", (32, 32), "[4, 1]", "same", "[0, 1]"),
+        ("[1, 1]", (32, 64), "[4, 1]", "same", "[0, 1]"),
+        ("[2, 2]", (16, 32), "[2, 1]", "same", "[0, 1]"),
+        ("[2, 1]", (16, 64), "[2, 1]", "same", "[0, 1]"),
     ],
 )
 def test_extract_tensor_ttgir(dtype, coords, result_shape, result_size_per_thread,
-                              result_layout_kind, tmp_path: pathlib.Path,
+                              result_layout_kind, order, tmp_path: pathlib.Path,
                               device):
     current_target = triton.runtime.driver.active.get_current_target()
     threads_per_warp = current_target.warp_size
-    threads_per_warp_layout, warps_per_cta, num_warps = \
-        _blocked_layout_for_warp_size(threads_per_warp)
+    parsed_order = tuple(ast.literal_eval(order))
+    src_size_per_thread, threads_per_warp_layout, warps_per_cta, num_warps = \
+        _blocked_layout_for_warp_size(threads_per_warp, parsed_order)
     result_m, result_n = result_shape
     if result_layout_kind == "blocked2":
         result_tpw_layout = _blocked2_threads_per_warp_layout(threads_per_warp)
+        result_order = [1, 0]
     else:
         result_tpw_layout = threads_per_warp_layout
+        result_order = list(parsed_order)
 
     ir = f"""
-    #src_blocked = #ttg.blocked<{{sizePerThread = [1, 4], threadsPerWarp = {_format_layout(threads_per_warp_layout)}, warpsPerCTA = {_format_layout(warps_per_cta)}, order = [1, 0]}}>
-    #dst_blocked = #ttg.blocked<{{sizePerThread = {result_size_per_thread}, threadsPerWarp = {_format_layout(result_tpw_layout)}, warpsPerCTA = {_format_layout(warps_per_cta)}, order = [1, 0]}}>
+    #src_blocked = #ttg.blocked<{{sizePerThread = {_format_layout(src_size_per_thread)}, threadsPerWarp = {_format_layout(threads_per_warp_layout)}, warpsPerCTA = {_format_layout(warps_per_cta)}, order = {_format_order(parsed_order)}}}>
+    #dst_blocked = #ttg.blocked<{{sizePerThread = {result_size_per_thread}, threadsPerWarp = {_format_layout(result_tpw_layout)}, warpsPerCTA = {_format_layout(warps_per_cta)}, order = {_format_order(result_order)}}}>
 
     module attributes {{"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = {num_warps} : i32, "ttg.threads-per-warp" = {threads_per_warp} : i32}} {{
       tt.func public @kernel(%arg0: !tt.ptr<f16> {{tt.divisibility = 16 : i32}}, %arg1: !tt.ptr<f16> {{tt.divisibility = 16 : i32}}) {{
@@ -264,6 +284,7 @@ def test_extract_tensor_ttgir(dtype, coords, result_shape, result_size_per_threa
             threads_per_warp,
             result_shape,
             parsed_coords,
+            parsed_order,
             tuple(ast.literal_eval(result_size_per_thread)),
             tuple(result_tpw_layout),
         )
