@@ -47,35 +47,39 @@ static std::string stringifyElemCoord(mlir::triton::gpu::ElemCoord coords) {
   return result;
 }
 
-// Resolves which source register owns `coordinates` for a fixed lane/warp
-// instance. ExtractTensorOp uses this in the verifier to prove that every
-// destination register can be served by a single source register without any
-// lane- or warp-dependent remapping.
+// Resolves a source register from logical coordinates using a precomputed
+// pseudoinverse of the source layout. This avoids rebuilding the pseudoinverse
+// for every ExtractTensorOp verifier query.
 static std::optional<int32_t>
-getRegisterIdForThread(const mlir::triton::LinearLayout &layout,
-                       mlir::triton::gpu::ElemCoord coordinates, int32_t lane,
-                       int32_t warp, mlir::MLIRContext *ctx) {
+getRegisterIdFromInvertedLayout(const mlir::triton::LinearLayout &invLayout,
+                                mlir::triton::gpu::ElemCoord coordinates,
+                                mlir::MLIRContext *ctx) {
   auto kReg = mlir::StringAttr::get(ctx, "register");
-  auto kLane = mlir::StringAttr::get(ctx, "lane");
-  auto kWarp = mlir::StringAttr::get(ctx, "warp");
-  auto kBlock = mlir::StringAttr::get(ctx, "block");
+  auto dims = invLayout.apply(coordinates);
+  std::optional<int32_t> regId;
+  for (auto [dim, value] : dims) {
+    if (dim == kReg) {
+      regId = value;
+      continue;
+    }
+    if (value != 0)
+      return std::nullopt;
+  }
+  return regId;
+}
 
-  llvm::SmallVector<std::pair<mlir::StringAttr, int32_t>> hardwareLocation = {
-      {kReg, 0}};
-  if (layout.hasInDim(kLane))
-    hardwareLocation.push_back({kLane, lane});
-  if (layout.hasInDim(kWarp))
-    hardwareLocation.push_back({kWarp, warp});
-  if (layout.hasInDim(kBlock))
-    hardwareLocation.push_back({kBlock, 0});
-
-  auto threadCoords = layout.apply(hardwareLocation);
+// Normalizes a logical source coordinate by removing the lane/warp contribution
+// of the source thread that owns it. If ExtractTensorOp is legal, the
+// normalized coordinates must be identical for every participating lane/warp of
+// a destination register.
+static mlir::triton::gpu::ElemCoord
+subtractThreadCoords(mlir::triton::gpu::ElemCoord coordinates,
+                     llvm::ArrayRef<std::pair<mlir::StringAttr, int32_t>>
+                         threadCoords) {
   for (auto [idx, threadCoord] : llvm::enumerate(threadCoords)) {
     coordinates[idx].second -= threadCoord.second;
   }
-
-  return mlir::triton::gpu::getRegisterIdFromCoordinates(layout, coordinates,
-                                                         ctx);
+  return coordinates;
 }
 
 // Accepts either a plain ranked tensor or a tensor pointer whose pointee is a
@@ -161,6 +165,7 @@ LogicalResult ExtractTensorOp::verify() {
   auto kLane = StringAttr::get(ctx, "lane");
   auto kWarp = StringAttr::get(ctx, "warp");
   auto kBlock = StringAttr::get(ctx, "block");
+  auto srcInvLL = srcLL.pseudoinvert();
 
   if (dstLL.hasInDim(kLane) != srcMappingLL.hasInDim(kLane) ||
       (dstLL.hasInDim(kLane) &&
@@ -184,11 +189,26 @@ LogicalResult ExtractTensorOp::verify() {
     return emitError("result register count cannot exceed the extracted source "
                      "register count");
   }
+  SmallVector<ElemCoord> srcThreadCoords;
+  srcThreadCoords.reserve(laneCount * warpCount);
+  for (int warp = 0; warp < warpCount; ++warp) {
+    for (int lane = 0; lane < laneCount; ++lane) {
+      SmallVector<std::pair<StringAttr, int32_t>> srcHardware = {{kReg, 0}};
+      if (srcLL.hasInDim(kLane))
+        srcHardware.push_back({kLane, lane});
+      if (srcLL.hasInDim(kWarp))
+        srcHardware.push_back({kWarp, warp});
+      if (srcLL.hasInDim(kBlock))
+        srcHardware.push_back({kBlock, 0});
+      srcThreadCoords.push_back(srcLL.apply(srcHardware));
+    }
+  }
   // For each destination register, verify that every participating lane/warp
-  // resolves to the same source register after applying the source extraction
-  // layout and tile offsets.
+  // resolves to the same normalized source coordinates after applying the
+  // source extraction layout and tile offsets. Once that is true, a single
+  // source-register lookup for the representative coordinates is sufficient.
   for (int regId = 0; regId < dstRegCount; ++regId) {
-    std::optional<int32_t> representativeSrcReg;
+    std::optional<ElemCoord> representativeNormalizedCoords;
     for (int lane = 0; lane < laneCount; ++lane) {
       for (int warp = 0; warp < warpCount; ++warp) {
         SmallVector<std::pair<StringAttr, int32_t>> srcExtractHardware = {
@@ -209,24 +229,25 @@ LogicalResult ExtractTensorOp::verify() {
           }
         }
 
-        std::optional<int32_t> srcReg =
-            getRegisterIdForThread(srcLL, elemCoords, lane, warp, ctx);
-        if (!srcReg) {
-          return emitError()
-                 << "no source register holds the element for destination "
-                    "index "
-                 << stringifyElemCoord(elemCoords);
-        }
-        if (!representativeSrcReg) {
-          representativeSrcReg = srcReg;
+        ElemCoord normalizedCoords = subtractThreadCoords(
+            elemCoords, srcThreadCoords[warp * laneCount + lane]);
+        if (!representativeNormalizedCoords) {
+          representativeNormalizedCoords = normalizedCoords;
           continue;
         }
-        if (*representativeSrcReg != *srcReg) {
+        if (*representativeNormalizedCoords != normalizedCoords) {
           return emitError(
               "result layout must map each destination register to a single "
               "source register without lane- or warp-dependent remapping");
         }
       }
+    }
+    auto srcReg = getRegisterIdFromInvertedLayout(
+        srcInvLL, *representativeNormalizedCoords, ctx);
+    if (!srcReg) {
+      return emitError()
+             << "no source register holds the element for destination index "
+             << stringifyElemCoord(*representativeNormalizedCoords);
     }
   }
 
