@@ -365,16 +365,39 @@ dstRegCount = 8
 For `coords = [1, 2]`, the lowering adds `offsets = [64, 64]` after
 applying `srcMappingLL`.
 
+The way to read the GF(2) tables is:
+
+- First use `A.3` to know how many destination registers exist.
+  `dstLL` has three register input bits (`reg1`, `reg2`, `reg4`), so
+  `dstRegCount = 2^3 = 8`.
+- For each `regId`, apply `A.2` at `(lane=0, warp=0, block=0)`.
+  Since all lane/warp inputs are zero, only the register columns in `A.2`
+  contribute.
+- Then add offsets `[64,64]`.
+- Finally use the full source table in `A.1` to convert the absolute logical
+  source coordinate back into a source register id.
+
 Representative examples:
 
-- `regId = 0`
-  - `srcMappingLL(reg=0,lane=0,warp=0) = [0,0]`
-  - add offsets -> `[64,64]`
-  - `getRegisterIdFromCoordinates(srcLL, [64,64]) = 40`
-- `regId = 4`
-  - `srcMappingLL(reg=4,lane=0,warp=0) = [32,0]`
-  - add offsets -> `[96,64]`
-  - `getRegisterIdFromCoordinates(srcLL, [96,64]) = 56`
+- `regId = 0 = 000b`
+  - In `A.2`, no register column is enabled, so
+    `srcMappingLL(reg=0,lane=0,warp=0) = [0,0]`
+  - Add offsets -> `[64,64]`
+  - In `A.1`, `dim0:64` is driven by `reg32` and `dim1:64` is driven by `reg8`
+  - So the source register id is `32 + 8 = 40`
+- `regId = 1 = 001b`
+  - In `A.2`, only `reg1` is enabled, and it contributes `dim1:1`
+  - So `srcMappingLL(reg=1,lane=0,warp=0) = [0,1]`
+  - Add offsets -> `[64,65]`
+  - In `A.1`, `[64,65]` means `reg32 + reg8 + reg1`
+  - So the source register id is `32 + 8 + 1 = 41`
+- `regId = 4 = 100b`
+  - In `A.2`, only `reg4` is enabled, and it contributes `dim0:32`
+  - So `srcMappingLL(reg=4,lane=0,warp=0) = [32,0]`
+  - Add offsets -> `[96,64]`
+  - In `A.1`, `[96,64]` means `dim0:64 + dim0:32 + dim1:64`
+  - Those come from `reg32 + reg16 + reg8`
+  - So the source register id is `32 + 16 + 8 = 56`
 
 So the final table is:
 
@@ -382,8 +405,19 @@ So the final table is:
 srcRegForDstReg = [40, 41, 42, 43, 56, 57, 58, 59]
 ```
 
-This is why `64x32` really spans two source replicas along `dim0` instead of
-duplicating the first `32x32` tile.
+From there the LLVM-side result is:
+
+```text
+resultVals = [
+  srcVals[40], srcVals[41], srcVals[42], srcVals[43],
+  srcVals[56], srcVals[57], srcVals[58], srcVals[59],
+]
+ret = packLLElements(resultVals, dstTy)
+```
+
+Because `dstTy` uses the same layout family as the extracted source span, this
+is a direct two-replica extraction along `dim0` instead of duplicating the
+first `32x32` tile.
 
 ## Example A': `128x128 -> 64x16`, Same Layout Family with Smaller `sizePerThread`
 
@@ -493,15 +527,45 @@ GF(2) table:
 
 ### B.3 Static Register Mapping
 
-Here:
+Here the same reasoning becomes smaller.
+
+- From `B.2`, `dstLL` has only one register input bit (`reg1`), so
+  `dstRegCount = 2`.
+- For each destination register id, apply `B.1` at `(lane=0, warp=0, block=0)`.
+  Only the register columns in `B.1` contribute.
+
+So:
+
+- `regId = 0 = 0b0`
+  - no register bit is enabled in `B.1`
+  - `srcMappingLL(reg=0,lane=0,warp=0) = [0,0]`
+  - add offsets `[32,64]` -> `[32,64]`
+  - in `A.1`, `dim0:32` comes from `reg16` and `dim1:64` comes from `reg8`
+  - source register id = `16 + 8 = 24`
+- `regId = 1 = 0b1`
+  - `reg1` is enabled in `B.1`, so it contributes `dim1:1`
+  - `srcMappingLL(reg=1,lane=0,warp=0) = [0,1]`
+  - add offsets `[32,64]` -> `[32,65]`
+  - in `A.1`, `[32,65]` means `reg16 + reg8 + reg1`
+  - source register id = `16 + 8 + 1 = 25`
+
+So:
 
 ```text
 dstRegCount = 2
 srcRegForDstReg = [24, 25]
 ```
 
-So the lowering takes only the first two source registers from the selected
-source replica and then packs them with the smaller destination layout.
+Then lowering materializes:
+
+```text
+resultVals = [srcVals[24], srcVals[25]]
+ret = packLLElements(resultVals, dstTy)
+```
+
+So the lowering takes only the first two destination registers from the
+selected source replica and then packs them with the smaller destination
+layout.
 
 ## Example C: `128x128 -> 32x16`, `blocked2` Reinterpretation
 
@@ -553,16 +617,33 @@ logical coordinates.
 
 ### C.2 Static Register Mapping
 
-The source side is still the same source replica, so:
+The source-side reasoning is exactly the same as Example B, because `srcMappingLL`
+is unchanged.
+
+- `dstLL` still has one low register bit that determines `dstRegCount = 2`
+- `srcMappingLL(reg=0,lane=0,warp=0) = [0,0]`
+- `srcMappingLL(reg=1,lane=0,warp=0) = [0,1]`
+- after adding offsets `[32,64]`, the absolute source coordinates are still
+  `[32,64]` and `[32,65]`
+- `A.1` still maps those to source register ids `24` and `25`
+
+So:
 
 ```text
 srcRegForDstReg = [24, 25]
 ```
 
+Lowering therefore builds the same source-side vector:
+
+```text
+resultVals = [srcVals[24], srcVals[25]]
+ret = packLLElements(resultVals, dstTy)
+```
+
 The difference from Example B is not which source registers are read. The
-difference is that `packLLElements(..., dstTy)` interprets those two registers
-under the `blocked2` destination layout, so the same local register values land
-at different logical `(dim0, dim1)` coordinates.
+difference is that `packLLElements(..., dstTy)` now interprets those two
+registers under the `blocked2` destination layout from `C.1`, so the same
+local register values land at different logical `(dim0, dim1)` coordinates.
 
 This is why the `blocked2` case is a register reinterpretation, not a
 contiguous logical slice.
