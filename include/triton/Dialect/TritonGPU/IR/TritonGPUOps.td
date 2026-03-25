@@ -66,6 +66,11 @@ def TTG_ExtractTensorOp : TTG_Op<"extract_tensor", [Pure]> {
                        DenseI32ArrayAttr:$coords);
   let results = (outs AnyTypeOf<[TT_TensorPtr, TT_Tensor]>:$result);
 
+  let builders = [
+    OpBuilder<(ins "Value":$src, "ArrayRef<int64_t>":$shape,
+                   "ArrayRef<int32_t>":$coords)>
+  ];
+
   let assemblyFormat = [{
     $src `[` custom<Offsets>($coords) `]` attr-dict `:` type($src)
     `->` type($result)

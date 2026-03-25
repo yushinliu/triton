@@ -92,10 +92,41 @@ static mlir::RankedTensorType getExtractTensorType(mlir::Type type) {
   return {};
 }
 
+static mlir::Attribute
+inferExtractTensorResultEncoding(mlir::RankedTensorType srcTy,
+                                 llvm::ArrayRef<int64_t> dstShape) {
+  mlir::Attribute srcEncoding = srcTy.getEncoding();
+  if (!srcEncoding)
+    return {};
+  return mlir::triton::gpu::LinearEncodingAttr::get(
+      srcTy.getContext(),
+      mlir::triton::gpu::getExtractTensorLinearLayout(srcTy, dstShape));
+}
+
+static mlir::Type inferExtractTensorResultType(mlir::Type srcType,
+                                               llvm::ArrayRef<int64_t> dstShape) {
+  auto srcTy = getExtractTensorType(srcType);
+  assert(srcTy && "expected ranked tensor or tensor pointer source");
+  auto resultTensorTy = mlir::RankedTensorType::get(
+      dstShape, srcTy.getElementType(),
+      inferExtractTensorResultEncoding(srcTy, dstShape));
+  if (auto ptrTy = llvm::dyn_cast<mlir::triton::PointerType>(srcType))
+    return mlir::triton::PointerType::get(resultTensorTy,
+                                          ptrTy.getAddressSpace());
+  return resultTensorTy;
+}
+
 #define GET_OP_CLASSES
 #include "triton/Dialect/TritonGPU/IR/Ops.cpp.inc"
 
 namespace mlir::triton::gpu {
+
+void ExtractTensorOp::build(OpBuilder &builder, OperationState &state, Value src,
+                            ArrayRef<int64_t> shape,
+                            ArrayRef<int32_t> coords) {
+  build(builder, state, inferExtractTensorResultType(src.getType(), shape), src,
+        builder.getDenseI32ArrayAttr(coords));
+}
 
 LogicalResult ExtractTensorOp::verify() {
   // ExtractTensorOp is valid only when the extraction can be expressed as a
