@@ -98,9 +98,12 @@ inferExtractTensorResultEncoding(mlir::RankedTensorType srcTy,
   mlir::Attribute srcEncoding = srcTy.getEncoding();
   if (!srcEncoding)
     return {};
-  return mlir::triton::gpu::LinearEncodingAttr::get(
-      srcTy.getContext(),
-      mlir::triton::gpu::getExtractTensorLinearLayout(srcTy, dstShape));
+  auto extractedLL =
+      mlir::triton::gpu::getExtractTensorLinearLayout(srcTy, dstShape);
+  if (mlir::triton::gpu::toLinearLayout(dstShape, srcEncoding) == extractedLL)
+    return srcEncoding;
+  return mlir::triton::gpu::LinearEncodingAttr::get(srcTy.getContext(),
+                                                    extractedLL);
 }
 
 static mlir::Type inferExtractTensorResultType(mlir::Type srcType,
