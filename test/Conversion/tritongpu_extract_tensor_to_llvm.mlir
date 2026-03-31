@@ -92,3 +92,18 @@ module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [8, 4], threadsPerWarp = [8, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+#blocked_partial = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+
+module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @extract_large_spt_order01(%arg0: tensor<64x128xi32, #blocked>) {
+    // CHECK-LABEL: llvm.func @extract_large_spt_order01
+    // CHECK-NOT: llvm.add
+    // CHECK-NOT: llvm.select
+    %0 = ttg.extract_tensor %arg0 [0, 4] : tensor<64x128xi32, #blocked> -> tensor<64x16xi32, #blocked_partial>
+    tt.return
+  }
+}
