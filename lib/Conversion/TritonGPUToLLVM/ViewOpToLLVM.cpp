@@ -12,6 +12,144 @@ using namespace mlir::triton::gpu;
 using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
 namespace {
 
+// Builds the static source-register ids selected by ExtractTensorOp by matching
+// the destination register bases to source register bases and decoding `coords`
+// over the remaining source register bases.
+static std::optional<SmallVector<int32_t>>
+getExtractTensorSourceRegistersFromRegisterBases(
+    const LinearLayout &srcLL, const LinearLayout &dstLL,
+    ArrayRef<int32_t> coords, MLIRContext *ctx) {
+  auto kReg = StringAttr::get(ctx, "register");
+  if (!srcLL.hasInDim(kReg) || !dstLL.hasInDim(kReg))
+    return std::nullopt;
+
+  const auto &srcRegBases = srcLL.getBases().find(kReg)->second;
+  const auto &dstRegBases = dstLL.getBases().find(kReg)->second;
+  SmallVector<int32_t> srcBasisForDstBit(dstRegBases.size(), -1);
+
+  SmallVector<SmallVector<int32_t>> sliceBasisIndices(coords.size());
+
+  struct BasisInfo {
+    int idx;
+    int dim;
+    int32_t value;
+  };
+  SmallVector<SmallVector<BasisInfo>> srcInfosPerDim(coords.size());
+  SmallVector<SmallVector<BasisInfo>> dstInfosPerDim(coords.size());
+
+  auto collectBasisInfos =
+      [&](llvm::ArrayRef<std::vector<int32_t>> bases,
+          SmallVectorImpl<SmallVector<BasisInfo>> &infosPerDim) {
+        for (auto [idx, basis] : llvm::enumerate(bases)) {
+          int nonZeroDim = -1;
+          int32_t nonZeroValue = 0;
+          for (auto [dim, value] : llvm::enumerate(basis)) {
+            if (value == 0)
+              continue;
+            if (nonZeroDim >= 0)
+              return false;
+            nonZeroDim = dim;
+            nonZeroValue = value;
+          }
+          if (nonZeroDim < 0 || nonZeroDim >= static_cast<int>(coords.size()))
+            return false;
+          infosPerDim[nonZeroDim].push_back(
+              {static_cast<int>(idx), nonZeroDim, nonZeroValue});
+        }
+        return true;
+      };
+  if (!collectBasisInfos(srcRegBases, srcInfosPerDim) ||
+      !collectBasisInfos(dstRegBases, dstInfosPerDim))
+    return std::nullopt;
+
+  for (int dim = 0; dim < static_cast<int>(coords.size()); ++dim) {
+    auto &srcInfos = srcInfosPerDim[dim];
+    auto &dstInfos = dstInfosPerDim[dim];
+    llvm::sort(srcInfos, [](const BasisInfo &lhs, const BasisInfo &rhs) {
+      return lhs.value < rhs.value;
+    });
+    llvm::sort(dstInfos, [](const BasisInfo &lhs, const BasisInfo &rhs) {
+      return lhs.value < rhs.value;
+    });
+
+    int srcCount = srcInfos.size();
+    int dstCount = dstInfos.size();
+    if (dstCount > srcCount)
+      return std::nullopt;
+
+    bool found = false;
+    int removedCount = srcCount - dstCount;
+    for (int mask = 0; mask < (1 << srcCount); ++mask) {
+      if (__builtin_popcount(mask) != removedCount)
+        continue;
+      SmallVector<int32_t> removed;
+      SmallVector<BasisInfo> keptInfos;
+      for (int i = 0; i < srcCount; ++i) {
+        if (mask & (1 << i))
+          removed.push_back(srcInfos[i].idx);
+        else
+          keptInfos.push_back(srcInfos[i]);
+      }
+      if (static_cast<int>(keptInfos.size()) != dstCount)
+        continue;
+
+      bool match = true;
+      for (int i = 0; i < dstCount; ++i) {
+        int removedLowerBits = 0;
+        for (int j = 0; j < srcCount; ++j) {
+          if (!(mask & (1 << j)))
+            continue;
+          if (srcInfos[j].value < keptInfos[i].value)
+            ++removedLowerBits;
+        }
+        if ((keptInfos[i].value >> removedLowerBits) != dstInfos[i].value) {
+          match = false;
+          break;
+        }
+      }
+      if (!match)
+        continue;
+
+      for (int i = 0; i < dstCount; ++i)
+        srcBasisForDstBit[dstInfos[i].idx] = keptInfos[i].idx;
+      for (int i = 0; i < srcCount; ++i) {
+        if (mask & (1 << i))
+          sliceBasisIndices[dim].push_back(srcInfos[i].idx);
+      }
+      found = true;
+      break;
+    }
+    if (!found)
+      return std::nullopt;
+  }
+
+  for (auto [dim, indices] : llvm::enumerate(sliceBasisIndices)) {
+    if (coords[dim] < 0 ||
+        coords[dim] >= (1 << static_cast<int32_t>(indices.size()))) {
+      return std::nullopt;
+    }
+  }
+
+  int dstRegCount = 1 << static_cast<int32_t>(dstRegBases.size());
+  SmallVector<int32_t> srcRegForDstReg;
+  srcRegForDstReg.reserve(dstRegCount);
+  for (int regId = 0; regId < dstRegCount; ++regId) {
+    int32_t srcReg = 0;
+    for (auto [dstBit, srcBit] : llvm::enumerate(srcBasisForDstBit)) {
+      if (regId & (1 << dstBit))
+        srcReg |= (1 << srcBit);
+    }
+    for (auto [dim, indices] : llvm::enumerate(sliceBasisIndices)) {
+      for (auto [bit, srcBit] : llvm::enumerate(indices)) {
+        if (coords[dim] & (1 << bit))
+          srcReg |= (1 << srcBit);
+      }
+    }
+    srcRegForDstReg.push_back(srcReg);
+  }
+  return srcRegForDstReg;
+}
+
 Value bitOrPtrCast(Value val, Type type, TritonLLVMOpBuilder &b) {
   if (isa<LLVM::LLVMPointerType>(val.getType()) &&
       !isa<LLVM::LLVMPointerType>(type)) {
@@ -323,19 +461,9 @@ struct ExtractTensorOpConversion
 
     auto srcLL = toLinearLayout(srcTy);
     auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
+    auto srcReplicaShape = getShapePerCTATile(srcTy);
     auto dstReplicaShape = getShapePerCTATile(dstTy);
     auto dstLL = toLinearLayout(dstTy).transposeOuts(outDimNames);
-    SmallVector<int64_t> coverageShape;
-    coverageShape.reserve(srcTy.getRank());
-    for (auto [replicaDim, resultDim] :
-         llvm::zip_equal(dstReplicaShape, dstTy.getShape())) {
-      coverageShape.push_back(std::max<int64_t>(replicaDim, resultDim));
-    }
-    // `srcMappingLL` models the logical coordinates exposed by the extracted
-    // source span implied by the destination layout before tile offsets are
-    // applied.
-    auto srcMappingLL =
-        getExtractTensorLinearLayout(srcTy, coverageShape).transposeOuts(outDimNames);
 
     SmallVector<int32_t> offsets;
     offsets.reserve(dstTy.getRank());
@@ -347,34 +475,72 @@ struct ExtractTensorOpConversion
     auto kLane = StringAttr::get(ctx, "lane");
     auto kWarp = StringAttr::get(ctx, "warp");
     auto kBlock = StringAttr::get(ctx, "block");
+
     int dstRegCount = dstLL.getInDimSize(kReg);
+    auto tryLogicalSlicePath =
+        [&](ArrayRef<int64_t> coverageShape) -> std::optional<SmallVector<int32_t>> {
+      auto srcMappingLL = getExtractTensorLinearLayout(srcTy, coverageShape)
+                              .transposeOuts(outDimNames);
+      SmallVector<int32_t> regs;
+      regs.reserve(dstRegCount);
+      for (int regId = 0; regId < dstRegCount; ++regId) {
+        SmallVector<std::pair<StringAttr, int32_t>> srcExtractHardware = {
+            {kReg, regId}};
+        if (srcMappingLL.hasInDim(kLane))
+          srcExtractHardware.push_back({kLane, 0});
+        if (srcMappingLL.hasInDim(kWarp))
+          srcExtractHardware.push_back({kWarp, 0});
+        if (srcMappingLL.hasInDim(kBlock))
+          srcExtractHardware.push_back({kBlock, 0});
 
-    // Collapse the source extraction layout into a single source register id
-    // for each destination register. The verifier has already proven that
-    // lane/warp do not change this mapping, so lane=warp=0 is sufficient here.
-    SmallVector<int32_t> srcRegForDstReg;
-    srcRegForDstReg.reserve(dstRegCount);
-    for (int regId = 0; regId < dstRegCount; ++regId) {
-      SmallVector<std::pair<StringAttr, int32_t>> srcExtractHardware = {
-          {kReg, regId}};
-      if (srcMappingLL.hasInDim(kLane))
-        srcExtractHardware.push_back({kLane, 0});
-      if (srcMappingLL.hasInDim(kWarp))
-        srcExtractHardware.push_back({kWarp, 0});
-      if (srcMappingLL.hasInDim(kBlock))
-        srcExtractHardware.push_back({kBlock, 0});
+        auto srcElemCoords = srcMappingLL.apply(srcExtractHardware);
+        for (auto [dim, offset] : llvm::enumerate(offsets))
+          srcElemCoords[dim].second += offset;
 
-      auto srcElemCoords = srcMappingLL.apply(srcExtractHardware);
-      for (auto [dim, offset] : llvm::enumerate(offsets))
-        srcElemCoords[dim].second += offset;
+        auto srcReg = getRegisterIdFromCoordinates(srcLL, srcElemCoords, ctx);
+        if (!srcReg)
+          return std::nullopt;
+        regs.push_back(*srcReg);
+      }
+      return regs;
+    };
 
-      auto srcReg = getRegisterIdFromCoordinates(srcLL, srcElemCoords, ctx);
-      if (!srcReg) {
+    SmallVector<int64_t> dstCoverageShape;
+    SmallVector<int64_t> srcCoverageShape;
+    for (auto [dstReplicaDim, srcReplicaDim, resultDim] :
+         llvm::zip_equal(dstReplicaShape, srcReplicaShape, dstTy.getShape())) {
+      dstCoverageShape.push_back(std::max<int64_t>(dstReplicaDim, resultDim));
+      srcCoverageShape.push_back(std::max<int64_t>(srcReplicaDim, resultDim));
+    }
+
+    auto maybeSrcRegForDstReg = tryLogicalSlicePath(dstCoverageShape);
+    if (!maybeSrcRegForDstReg)
+      maybeSrcRegForDstReg = tryLogicalSlicePath(srcCoverageShape);
+    if (!maybeSrcRegForDstReg) {
+      auto maybeSrcRegForDstReg = getExtractTensorSourceRegistersFromRegisterBases(
+          srcLL, dstLL, op.getCoords(), ctx);
+      if (!maybeSrcRegForDstReg) {
         return rewriter.notifyMatchFailure(
             op, "failed to derive a static source register mapping");
       }
-      srcRegForDstReg.push_back(*srcReg);
+      dstRegCount = maybeSrcRegForDstReg->size();
+      SmallVector<Value> resultVals;
+      resultVals.reserve(dstRegCount);
+      for (int regId = 0; regId < dstRegCount; ++regId) {
+        int32_t srcReg = (*maybeSrcRegForDstReg)[regId];
+        if (srcReg < 0 || static_cast<size_t>(srcReg) >= srcVals.size()) {
+          return rewriter.notifyMatchFailure(
+              op, "static source register mapping is out of range");
+        }
+        resultVals.push_back(srcVals[srcReg]);
+      }
+      Value ret = packLLElements(loc, getTypeConverter(), resultVals, rewriter,
+                                 dstTy);
+      rewriter.replaceOp(op, ret);
+      return success();
     }
+    auto srcRegForDstReg = *maybeSrcRegForDstReg;
+    dstRegCount = srcRegForDstReg.size();
 
     // Materialize the final register vector by pure index selection from the
     // unpacked source registers, then reinterpret that vector with the dst

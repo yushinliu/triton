@@ -110,7 +110,6 @@ def _extract_linear_layout(layout, extracted_shape):
         require_surjective=False,
     )
 
-
 def _in_dim_size(layout, dim_name):
     bases = dict(layout.bases)
     return 1 << len(bases.get(dim_name, []))
@@ -125,43 +124,125 @@ def _get_register_id_from_coords(layout, coords):
     return reg
 
 
+def _source_regs_from_register_bases(src_layout, dst_layout, coords):
+    src_reg_bases = list(dict(src_layout.bases).get("register", []))
+    dst_reg_bases = list(dict(dst_layout.bases).get("register", []))
+    src_basis_for_dst_bit = [-1] * len(dst_reg_bases)
+
+    def _collect_basis_infos(bases):
+        infos_per_dim = [[] for _ in coords]
+        for idx, basis in enumerate(bases):
+            non_zero_dims = [dim for dim, value in enumerate(basis) if value != 0]
+            if len(non_zero_dims) != 1:
+                raise AssertionError(f"unsupported register basis: {basis}")
+            dim = non_zero_dims[0]
+            infos_per_dim[dim].append((idx, basis[dim]))
+        for infos in infos_per_dim:
+            infos.sort(key=lambda item: item[1])
+        return infos_per_dim
+
+    src_infos_per_dim = _collect_basis_infos(src_reg_bases)
+    dst_infos_per_dim = _collect_basis_infos(dst_reg_bases)
+    slice_basis_indices = [[] for _ in coords]
+
+    for dim, (src_infos, dst_infos) in enumerate(zip(src_infos_per_dim, dst_infos_per_dim)):
+        if len(dst_infos) > len(src_infos):
+            raise AssertionError("destination register bases exceed source register bases")
+
+        found = False
+        src_count = len(src_infos)
+        dst_count = len(dst_infos)
+        removed_count = src_count - dst_count
+        for mask in range(1 << src_count):
+            if mask.bit_count() != removed_count:
+                continue
+            kept_infos = [src_infos[i] for i in range(src_count) if not (mask & (1 << i))]
+            if len(kept_infos) != dst_count:
+                continue
+
+            match = True
+            for i, (_, dst_value) in enumerate(dst_infos):
+                kept_idx, kept_value = kept_infos[i]
+                removed_lower_bits = sum(
+                    1 for j in range(src_count)
+                    if (mask & (1 << j)) and src_infos[j][1] < kept_value
+                )
+                if (kept_value >> removed_lower_bits) != dst_value:
+                    match = False
+                    break
+            if not match:
+                continue
+
+            for i, (dst_idx, _) in enumerate(dst_infos):
+                src_basis_for_dst_bit[dst_idx] = kept_infos[i][0]
+            for i in range(src_count):
+                if mask & (1 << i):
+                    slice_basis_indices[dim].append(src_infos[i][0])
+            found = True
+            break
+
+        if not found:
+            raise AssertionError("failed to match destination register bases to source register bases")
+
+    for dim, indices in enumerate(slice_basis_indices):
+        if coords[dim] < 0 or coords[dim] >= (1 << len(indices)):
+            raise AssertionError(f"invalid coords {coords} for slice bases {slice_basis_indices}")
+
+    dst_reg_count = 1 << len(dst_reg_bases)
+    src_reg_for_dst_reg = []
+    for reg in range(dst_reg_count):
+        src_reg = 0
+        for dst_bit, src_bit in enumerate(src_basis_for_dst_bit):
+            if reg & (1 << dst_bit):
+                src_reg |= (1 << src_bit)
+        for dim, indices in enumerate(slice_basis_indices):
+            for bit, src_bit in enumerate(indices):
+                if coords[dim] & (1 << bit):
+                    src_reg |= (1 << src_bit)
+        src_reg_for_dst_reg.append(src_reg)
+    return src_reg_for_dst_reg
+
+
 def _expected_extract_tensor_for_layout(
         x: torch.Tensor, src_shape, src_size_per_thread, src_threads_per_warp,
         warps_per_cta, src_order, result_shape, coords, result_size_per_thread,
         result_threads_per_warp_layout, result_order):
-    src_size_per_thread = tuple(src_size_per_thread)
-    src_threads_per_warp = tuple(src_threads_per_warp)
-    warps_per_cta = tuple(warps_per_cta)
-    replica_shape = tuple(
-        size * threads * warps for size, threads, warps in zip(
-            src_size_per_thread, src_threads_per_warp, warps_per_cta))
-    coverage_shape = tuple(
-        max(replica_dim, result_dim)
-        for replica_dim, result_dim in zip(replica_shape, result_shape))
-    src_start = tuple(
-        coord * size for coord, size in zip(coords, result_shape))
-
-    src_layout = _linear_layout(src_shape, src_size_per_thread,
-                                src_threads_per_warp, warps_per_cta,
+    src_layout = _linear_layout(tuple(src_shape), tuple(src_size_per_thread),
+                                tuple(src_threads_per_warp), tuple(warps_per_cta),
                                 tuple(src_order))
-    dst_layout = _linear_layout(result_shape, result_size_per_thread,
+    dst_layout = _linear_layout(tuple(result_shape), tuple(result_size_per_thread),
                                 tuple(result_threads_per_warp_layout),
                                 tuple(warps_per_cta), tuple(result_order))
-    extracted_layout = _extract_linear_layout(src_layout, coverage_shape)
-    src_reg_for_dst_reg = []
-    for reg in range(_in_dim_size(dst_layout, "register")):
-        extracted_coords = extracted_layout.apply({
-            "register": reg,
-            "lane": 0,
-            "warp": 0,
-            "block": 0,
-        })
-        src_reg_for_dst_reg.append(
-            _get_register_id_from_coords(
-                src_layout,
-                (extracted_coords["dim0"] + src_start[0],
-                 extracted_coords["dim1"] + src_start[1]),
-            ))
+    try:
+        src_size_per_thread = tuple(src_size_per_thread)
+        src_threads_per_warp = tuple(src_threads_per_warp)
+        warps_per_cta = tuple(warps_per_cta)
+        replica_shape = tuple(
+            size * threads * warps for size, threads, warps in zip(
+                src_size_per_thread, src_threads_per_warp, warps_per_cta))
+        coverage_shape = tuple(
+            max(replica_dim, result_dim)
+            for replica_dim, result_dim in zip(replica_shape, result_shape))
+        src_start = tuple(
+            coord * size for coord, size in zip(coords, result_shape))
+        extracted_layout = _extract_linear_layout(src_layout, coverage_shape)
+        src_reg_for_dst_reg = []
+        for reg in range(_in_dim_size(dst_layout, "register")):
+            extracted_coords = extracted_layout.apply({
+                "register": reg,
+                "lane": 0,
+                "warp": 0,
+                "block": 0,
+            })
+            src_reg_for_dst_reg.append(
+                _get_register_id_from_coords(
+                    src_layout,
+                    (extracted_coords["dim0"] + src_start[0],
+                     extracted_coords["dim1"] + src_start[1]),
+                ))
+    except AssertionError:
+        src_reg_for_dst_reg = _source_regs_from_register_bases(
+            src_layout, dst_layout, coords)
 
     expected = torch.empty(result_shape, device=x.device, dtype=x.dtype)
     visited = torch.zeros(result_shape, device=x.device, dtype=torch.bool)
@@ -378,6 +459,91 @@ def test_extract_tensor_ttgir_large_size_per_thread_order01(
     """
 
     temp_file = tmp_path / "test_extract_tensor_large_spt_order01.ttgir"
+    temp_file.write_text(ir_text)
+    kernel = triton.compile(str(temp_file), target=current_target)
+
+    x = torch.randn(src_shape, device=device, dtype=dtype)
+    y = torch.empty(result_shape, device=device, dtype=dtype)
+
+    kernel[(1, 1, 1)](x.data_ptr(), y.data_ptr())
+    expected = _expected_extract_tensor_for_layout(
+        x,
+        src_shape,
+        src_size_per_thread,
+        src_threads_per_warp,
+        warps_per_cta,
+        src_order,
+        result_shape,
+        coords,
+        result_size_per_thread,
+        result_threads_per_warp,
+        src_order,
+    )
+    assert torch.equal(y, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("result_size_per_thread", [(8, 1), (8, 2)])
+def test_extract_tensor_ttgir_large_size_per_thread_order01_wide_slice(
+        dtype, result_size_per_thread, tmp_path: pathlib.Path, device):
+    current_target = triton.runtime.driver.active.get_current_target()
+    threads_per_warp = current_target.warp_size
+    src_size_per_thread = (8, 4)
+    src_order = (0, 1)
+    if threads_per_warp == 32:
+        warps_per_cta = (1, 4)
+        src_shape = (64, 128)
+        src_threads_per_warp = (8, 4)
+        result_shape = (64, 32)
+        coords = (0, 3)
+        num_warps = 4
+    else:
+        pytest.skip("wide-slice large-size-per-thread cases are defined for warp_size=32")
+
+    result_threads_per_warp = src_threads_per_warp
+    src_m, src_n = src_shape
+    result_m, result_n = result_shape
+
+    ir_text = f"""
+    #src_blocked = #ttg.blocked<{{sizePerThread = {_format_layout(src_size_per_thread)}, threadsPerWarp = {_format_layout(src_threads_per_warp)}, warpsPerCTA = {_format_layout(warps_per_cta)}, order = {_format_order(src_order)}}}>
+    #dst_blocked = #ttg.blocked<{{sizePerThread = {_format_layout(result_size_per_thread)}, threadsPerWarp = {_format_layout(result_threads_per_warp)}, warpsPerCTA = {_format_layout(warps_per_cta)}, order = {_format_order(src_order)}}}>
+
+    module attributes {{"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = {num_warps} : i32, "ttg.threads-per-warp" = {threads_per_warp} : i32}} {{
+      tt.func public @kernel(%arg0: !tt.ptr<f16> {{tt.divisibility = 16 : i32}}, %arg1: !tt.ptr<f16> {{tt.divisibility = 16 : i32}}) {{
+        %cst128 = arith.constant dense<{src_n}> : tensor<{src_m}x1xi32, #src_blocked>
+        %cst_dst = arith.constant dense<{result_n}> : tensor<{result_m}x1xi32, #dst_blocked>
+
+        %row = tt.make_range {{end = {src_m} : i32, start = 0 : i32}} : tensor<{src_m}xi32, #ttg.slice<{{dim = 1, parent = #src_blocked}}>>
+        %col = tt.make_range {{end = {src_n} : i32, start = 0 : i32}} : tensor<{src_n}xi32, #ttg.slice<{{dim = 0, parent = #src_blocked}}>>
+        %src_ptr = tt.splat %arg0 : !tt.ptr<f16> -> tensor<{src_m}x{src_n}x!tt.ptr<f16>, #src_blocked>
+        %row2d = tt.expand_dims %row {{axis = 1 : i32}} : tensor<{src_m}xi32, #ttg.slice<{{dim = 1, parent = #src_blocked}}>> -> tensor<{src_m}x1xi32, #src_blocked>
+        %col2d = tt.expand_dims %col {{axis = 0 : i32}} : tensor<{src_n}xi32, #ttg.slice<{{dim = 0, parent = #src_blocked}}>> -> tensor<1x{src_n}xi32, #src_blocked>
+        %row_ofs = arith.muli %row2d, %cst128 : tensor<{src_m}x1xi32, #src_blocked>
+        %row_bcast = tt.broadcast %row_ofs : tensor<{src_m}x1xi32, #src_blocked> -> tensor<{src_m}x{src_n}xi32, #src_blocked>
+        %col_bcast = tt.broadcast %col2d : tensor<1x{src_n}xi32, #src_blocked> -> tensor<{src_m}x{src_n}xi32, #src_blocked>
+        %src_ofs = arith.addi %row_bcast, %col_bcast : tensor<{src_m}x{src_n}xi32, #src_blocked>
+        %src_ptrs = tt.addptr %src_ptr, %src_ofs : tensor<{src_m}x{src_n}x!tt.ptr<f16>, #src_blocked>, tensor<{src_m}x{src_n}xi32, #src_blocked>
+        %src = tt.load %src_ptrs : tensor<{src_m}x{src_n}x!tt.ptr<f16>, #src_blocked>
+
+        %tile = ttg.extract_tensor %src {_format_layout(coords)} : tensor<{src_m}x{src_n}xf16, #src_blocked> -> tensor<{result_m}x{result_n}xf16, #dst_blocked>
+
+        %dst_row = tt.make_range {{end = {result_m} : i32, start = 0 : i32}} : tensor<{result_m}xi32, #ttg.slice<{{dim = 1, parent = #dst_blocked}}>>
+        %dst_col = tt.make_range {{end = {result_n} : i32, start = 0 : i32}} : tensor<{result_n}xi32, #ttg.slice<{{dim = 0, parent = #dst_blocked}}>>
+        %dst_ptr = tt.splat %arg1 : !tt.ptr<f16> -> tensor<{result_m}x{result_n}x!tt.ptr<f16>, #dst_blocked>
+        %dst_row2d = tt.expand_dims %dst_row {{axis = 1 : i32}} : tensor<{result_m}xi32, #ttg.slice<{{dim = 1, parent = #dst_blocked}}>> -> tensor<{result_m}x1xi32, #dst_blocked>
+        %dst_col2d = tt.expand_dims %dst_col {{axis = 0 : i32}} : tensor<{result_n}xi32, #ttg.slice<{{dim = 0, parent = #dst_blocked}}>> -> tensor<1x{result_n}xi32, #dst_blocked>
+        %dst_row_ofs = arith.muli %dst_row2d, %cst_dst : tensor<{result_m}x1xi32, #dst_blocked>
+        %dst_row_bcast = tt.broadcast %dst_row_ofs : tensor<{result_m}x1xi32, #dst_blocked> -> tensor<{result_m}x{result_n}xi32, #dst_blocked>
+        %dst_col_bcast = tt.broadcast %dst_col2d : tensor<1x{result_n}xi32, #dst_blocked> -> tensor<{result_m}x{result_n}xi32, #dst_blocked>
+        %dst_ofs = arith.addi %dst_row_bcast, %dst_col_bcast : tensor<{result_m}x{result_n}xi32, #dst_blocked>
+        %dst_ptrs = tt.addptr %dst_ptr, %dst_ofs : tensor<{result_m}x{result_n}x!tt.ptr<f16>, #dst_blocked>, tensor<{result_m}x{result_n}xi32, #dst_blocked>
+        tt.store %dst_ptrs, %tile : tensor<{result_m}x{result_n}x!tt.ptr<f16>, #dst_blocked>
+        tt.return
+      }}
+    }}
+    """
+
+    temp_file = tmp_path / f"test_extract_tensor_large_spt_order01_wide_slice_{result_size_per_thread[1]}.ttgir"
     temp_file.write_text(ir_text)
     kernel = triton.compile(str(temp_file), target=current_target)
 
