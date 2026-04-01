@@ -162,18 +162,18 @@ LogicalResult ExtractTensorOp::verify() {
     return emitError("coordinates must have the same rank as input");
 
   auto srcLL = toLinearLayout(srcTy);
-  auto replicaShape = getShapePerCTATile(srcTy);
+  auto dstReplicaShape = getShapePerCTATile(dstTy);
   auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
   auto dstLL = toLinearLayout(dstTy).transposeOuts(outDimNames);
   SmallVector<int64_t> coverageShape;
   coverageShape.reserve(srcTy.getRank());
   for (auto [replicaDim, resultDim] :
-       llvm::zip_equal(replicaShape, dstTy.getShape())) {
+       llvm::zip_equal(dstReplicaShape, dstTy.getShape())) {
     coverageShape.push_back(std::max<int64_t>(replicaDim, resultDim));
   }
-  // `srcMappingLL` describes the source-side span that needs to be visible to
-  // derive the remap. It may be larger than the final result shape when the
-  // destination spans multiple replicas.
+  // `srcMappingLL` describes the source-side span implied by the destination
+  // layout. It may be larger than the final result shape when the destination
+  // spans multiple destination replicas.
   auto srcMappingLL =
       getExtractTensorLinearLayout(srcTy, coverageShape).transposeOuts(outDimNames);
 

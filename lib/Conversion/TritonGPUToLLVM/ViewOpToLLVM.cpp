@@ -323,16 +323,17 @@ struct ExtractTensorOpConversion
 
     auto srcLL = toLinearLayout(srcTy);
     auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
-    auto replicaShape = getShapePerCTATile(srcTy);
+    auto dstReplicaShape = getShapePerCTATile(dstTy);
     auto dstLL = toLinearLayout(dstTy).transposeOuts(outDimNames);
     SmallVector<int64_t> coverageShape;
     coverageShape.reserve(srcTy.getRank());
     for (auto [replicaDim, resultDim] :
-         llvm::zip_equal(replicaShape, dstTy.getShape())) {
+         llvm::zip_equal(dstReplicaShape, dstTy.getShape())) {
       coverageShape.push_back(std::max<int64_t>(replicaDim, resultDim));
     }
     // `srcMappingLL` models the logical coordinates exposed by the extracted
-    // source span before tile offsets are applied.
+    // source span implied by the destination layout before tile offsets are
+    // applied.
     auto srcMappingLL =
         getExtractTensorLinearLayout(srcTy, coverageShape).transposeOuts(outDimNames);
 

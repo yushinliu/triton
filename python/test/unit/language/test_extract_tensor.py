@@ -323,7 +323,7 @@ def test_extract_tensor_ttgir_large_size_per_thread_order01(
         src_shape = (64, 128)
         src_threads_per_warp = (8, 4)
         result_shape = (64, 16)
-        coords = (0, 4)
+        coords = (0, 7)
         num_warps = 4
     elif threads_per_warp == 64:
         warps_per_cta = (1, 4)
