@@ -497,8 +497,15 @@ def test_extract_tensor_ttgir_large_size_per_thread_order01_wide_slice(
         result_shape = (64, 32)
         coords = (0, 3)
         num_warps = 4
+    elif threads_per_warp == 64:
+        warps_per_cta = (1, 4)
+        src_shape = (128, 128)
+        src_threads_per_warp = (16, 4)
+        result_shape = (128, 32)
+        coords = (0, 3)
+        num_warps = 4
     else:
-        pytest.skip("wide-slice large-size-per-thread cases are defined for warp_size=32")
+        pytest.skip(f"unsupported warp size {threads_per_warp}")
 
     result_threads_per_warp = src_threads_per_warp
     src_m, src_n = src_shape
