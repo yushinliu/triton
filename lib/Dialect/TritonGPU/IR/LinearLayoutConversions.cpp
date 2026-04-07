@@ -53,6 +53,11 @@ SmallVector<StringAttr> permuteDimNames(const SmallVector<StringAttr> &names,
   return ret;
 }
 
+SmallVector<unsigned> getMACAMmaThreadNum(bool colMajor) {
+  return colMajor ? SmallVector<unsigned>{16, 4}
+                  : SmallVector<unsigned>{4, 16};
+}
+
 LinearLayout swizzledSharedToLinearLayout(ArrayRef<int64_t> shape,
                                           SwizzledSharedEncodingAttr shared) {
   MLIRContext *ctx = shared.getContext();
@@ -445,6 +450,59 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   }
 
   return combineCtaCgaWithShape(tileLayout, getCTALayout(), shape);
+}
+
+LinearLayout MACAMmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
+  auto ctx = getContext();
+  int rank = shape.size();
+  assert(rank == getRank());
+
+  auto elemsMNK = getElementsMNK();
+  int64_t tM = elemsMNK[0];
+  int64_t tN = elemsMNK[1];
+  assert(getVersionMajor() == 2 && "only versionMajor = 2 is supported");
+  assert(!getIsATrans() && !getIsBTrans() &&
+         "MACA MMA transpose variants are not supported");
+
+  auto mmaThreadNum = getMACAMmaThreadNum(getColMajor() != 0);
+  constexpr int64_t numCPersInst = 4;
+  if (getColMajor() != 0)
+    tN *= numCPersInst;
+  else
+    tM *= numCPersInst;
+
+  int mDim = 0;
+  int nDim = 1;
+  int64_t mThread = mmaThreadNum[mDim];
+  int64_t nThread = mmaThreadNum[nDim];
+
+  auto warpsPerCTA = getWarpsPerCTA();
+  auto outDimNames = standardOutDimNames(ctx, rank);
+
+  auto ctaLayout =
+      LinearLayout::identity1D(tN, S("register"), outDimNames[nDim]) *
+      LinearLayout::identity1D(tM, S("register"), outDimNames[mDim]);
+
+  SmallVector<unsigned> threadOrder =
+      getColMajor() != 0 ? SmallVector<unsigned>{0, 1}
+                         : SmallVector<unsigned>{1, 0};
+  ctaLayout *=
+      identityStandardND(S("lane"), mmaThreadNum, threadOrder)
+          .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
+
+  auto warpOrder = getMatrixOrder(rank, /*rowMajor=*/true);
+  ctaLayout *= identityStandardND(S("warp"), warpsPerCTA, warpOrder)
+                   .transposeOuts(llvm::to_vector(ctaLayout.getOutDimNames()));
+
+  int64_t repM = std::max<int64_t>(
+      shape[mDim] / (warpsPerCTA[mDim] * mThread * tM), int64_t{1});
+  int64_t repN = std::max<int64_t>(
+      shape[nDim] / (warpsPerCTA[nDim] * nThread * tN), int64_t{1});
+  ctaLayout *=
+      LinearLayout::identity1D(repN, S("register"), outDimNames[nDim]) *
+      LinearLayout::identity1D(repM, S("register"), outDimNames[mDim]);
+
+  return combineCtaCgaWithShape(ctaLayout, getCTALayout(), shape);
 }
 
 std::optional<LinearLayout>

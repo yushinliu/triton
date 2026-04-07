@@ -12,6 +12,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
 #include "triton/Target/LLVMIR/Passes.h"
+#include "nvidia/include/TritonNVIDIAGPUToLLVM/Passes.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -56,6 +57,19 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   using namespace mlir;
   using namespace mlir::triton::gpu;
   using namespace mlir::triton::instrument;
+  m.def(
+      "add_convert_triton_gpu_to_llvm",
+      [](mlir::PassManager &pm, int computeCapability, int ptxVersion) {
+        if (ptxVersion == 0) {
+          pm.addPass(
+              mlir::triton::createConvertTritonGPUToLLVMPass(computeCapability));
+        } else {
+          pm.addPass(mlir::triton::createConvertTritonGPUToLLVMPass(
+              computeCapability, ptxVersion));
+        }
+      },
+      py::arg("pm"), py::arg("compute_capability"),
+      py::arg("ptx_version") = 0);
   ADD_PASS_WRAPPER_0("add_coalesce", createTritonGPUCoalesce);
   ADD_PASS_WRAPPER_0("add_optimize_thread_locality",
                      createTritonGPUOptimizeThreadLocality);

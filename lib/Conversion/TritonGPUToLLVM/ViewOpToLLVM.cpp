@@ -150,6 +150,12 @@ getExtractTensorSourceRegistersFromRegisterBases(
   return srcRegForDstReg;
 }
 
+static bool useRegisterBasisOnlyForExtractTensor(RankedTensorType srcTy,
+                                                 RankedTensorType dstTy) {
+  return isa<MACAMmaEncodingAttr>(srcTy.getEncoding()) ||
+         isa<MACAMmaEncodingAttr>(dstTy.getEncoding());
+}
+
 Value bitOrPtrCast(Value val, Type type, TritonLLVMOpBuilder &b) {
   if (isa<LLVM::LLVMPointerType>(val.getType()) &&
       !isa<LLVM::LLVMPointerType>(type)) {
@@ -513,9 +519,12 @@ struct ExtractTensorOpConversion
       srcCoverageShape.push_back(std::max<int64_t>(srcReplicaDim, resultDim));
     }
 
-    auto maybeSrcRegForDstReg = tryLogicalSlicePath(dstCoverageShape);
-    if (!maybeSrcRegForDstReg)
-      maybeSrcRegForDstReg = tryLogicalSlicePath(srcCoverageShape);
+    std::optional<SmallVector<int32_t>> maybeSrcRegForDstReg;
+    if (!useRegisterBasisOnlyForExtractTensor(srcTy, dstTy)) {
+      maybeSrcRegForDstReg = tryLogicalSlicePath(dstCoverageShape);
+      if (!maybeSrcRegForDstReg)
+        maybeSrcRegForDstReg = tryLogicalSlicePath(srcCoverageShape);
+    }
     if (!maybeSrcRegForDstReg) {
       auto maybeSrcRegForDstReg = getExtractTensorSourceRegistersFromRegisterBases(
           srcLL, dstLL, op.getCoords(), ctx);

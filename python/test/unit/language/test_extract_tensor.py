@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import triton
-from triton._C.libtriton import gluon_ir, ir
+from triton._C.libtriton import gluon_ir, ir, passes
 from triton.experimental.gluon import language as ttgl
 from triton.tools import LinearLayout
 
@@ -572,3 +572,34 @@ def test_extract_tensor_ttgir_large_size_per_thread_order01_wide_slice(
         src_order,
     )
     assert torch.equal(y, expected)
+
+
+def test_extract_tensor_ttgir_maca_mma_lowering(tmp_path: pathlib.Path):
+    ir_text = """
+    #src_maca = #ttg.maca_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], elementsMNK = [1, 4, 8], colMajor = 0, isATrans = false, isBTrans = false, elementsStride = [1, 1]}>
+    #dst_maca = #ttg.maca_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], elementsMNK = [1, 1, 8], colMajor = 0, isATrans = false, isBTrans = false, elementsStride = [1, 1]}>
+
+    module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+      tt.func @extract_maca_mma(%arg0: tensor<128x128xi32, #src_maca>) {
+        %0 = ttg.extract_tensor %arg0 [3, 2] : tensor<128x128xi32, #src_maca> -> tensor<32x32xi32, #dst_maca>
+        tt.return
+      }
+    }
+    """
+
+    temp_file = tmp_path / "test_extract_tensor_maca_mma.ttgir"
+    temp_file.write_text(ir_text)
+
+    ctx = ir.context()
+    ir.load_dialects(ctx)
+    mod = ir.parse_mlir_module(str(temp_file), ctx)
+
+    pm = ir.pass_manager(ctx)
+    passes.ttgpuir.add_convert_triton_gpu_to_llvm(pm, 90)
+    pm.run(mod, "extract-tensor-maca-mma-lowering")
+
+    mod_text = str(mod)
+    assert "llvm.func @extract_maca_mma" in mod_text
+    assert "ttg.extract_tensor" not in mod_text
+    assert "llvm.add" not in mod_text
+    assert "llvm.select" not in mod_text

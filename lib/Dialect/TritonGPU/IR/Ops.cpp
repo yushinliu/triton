@@ -246,6 +246,12 @@ static mlir::Type inferExtractTensorResultType(mlir::Type srcType,
   return resultTensorTy;
 }
 
+static bool useRegisterBasisOnlyForExtractTensor(mlir::RankedTensorType srcTy,
+                                                 mlir::RankedTensorType dstTy) {
+  return mlir::isa<mlir::triton::gpu::MACAMmaEncodingAttr>(srcTy.getEncoding()) ||
+         mlir::isa<mlir::triton::gpu::MACAMmaEncodingAttr>(dstTy.getEncoding());
+}
+
 #define GET_OP_CLASSES
 #include "triton/Dialect/TritonGPU/IR/Ops.cpp.inc"
 
@@ -409,8 +415,11 @@ LogicalResult ExtractTensorOp::verify() {
     dstCoverageShape.push_back(std::max<int64_t>(dstReplicaDim, resultDim));
     srcCoverageShape.push_back(std::max<int64_t>(srcReplicaDim, resultDim));
   }
-  if (tryLogicalSlicePath(dstCoverageShape) || tryLogicalSlicePath(srcCoverageShape))
+  if (!useRegisterBasisOnlyForExtractTensor(srcTy, dstTy) &&
+      (tryLogicalSlicePath(dstCoverageShape) ||
+       tryLogicalSlicePath(srcCoverageShape))) {
     return success();
+  }
 
   auto srcRegForDstReg =
       getExtractTensorSourceRegistersFromRegisterBases(srcLL, dstLL, coords, ctx);

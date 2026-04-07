@@ -122,3 +122,18 @@ module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32
     tt.return
   }
 }
+
+// -----
+
+#src_maca = #ttg.maca_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], elementsMNK = [1, 4, 8], colMajor = 0, isATrans = false, isBTrans = false, elementsStride = [1, 1]}>
+#dst_maca = #ttg.maca_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], elementsMNK = [1, 1, 8], colMajor = 0, isATrans = false, isBTrans = false, elementsStride = [1, 1]}>
+
+module attributes {"ttg.compute-capability" = 90 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @extract_maca_mma(%arg0: tensor<128x128xi32, #src_maca>) {
+    // CHECK-LABEL: llvm.func @extract_maca_mma
+    // CHECK-NOT: llvm.add
+    // CHECK-NOT: llvm.select
+    %0 = ttg.extract_tensor %arg0 [3, 2] : tensor<128x128xi32, #src_maca> -> tensor<32x32xi32, #dst_maca>
+    tt.return
+  }
+}

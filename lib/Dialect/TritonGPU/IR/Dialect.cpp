@@ -1447,8 +1447,134 @@ LogicalResult AMDMfmaEncodingAttr::verify(
 }
 
 //===----------------------------------------------------------------------===//
+// MACA MMA encoding
+//===----------------------------------------------------------------------===//
+
+Attribute MACAMmaEncodingAttr::parse(AsmParser &parser, Type type) {
+  if (parser.parseLess().failed())
+    return {};
+  DictionaryAttr dict;
+  if (parser.parseAttribute(dict).failed())
+    return {};
+  if (parser.parseGreater().failed())
+    return {};
+
+  unsigned versionMajor = 0;
+  unsigned versionMinor = 0;
+  SmallVector<unsigned> warpsPerCTA;
+  SmallVector<unsigned> elementsMNK;
+  unsigned colMajor = 0;
+  bool isATrans = false;
+  bool isBTrans = false;
+  SmallVector<unsigned> elementsStride;
+  Attribute ctaAttr = nullptr;
+
+  for (const NamedAttribute &attr : dict) {
+    if (attr.getName() == "versionMajor") {
+      if (parseUInt(parser, attr, versionMajor, "versionMajor").failed())
+        return {};
+    }
+    if (attr.getName() == "versionMinor") {
+      if (parseUInt(parser, attr, versionMinor, "versionMinor").failed())
+        return {};
+    }
+    if (attr.getName() == "warpsPerCTA") {
+      if (parseIntArrayAttr(parser, attr, warpsPerCTA, "warpsPerCTA").failed())
+        return {};
+    }
+    if (attr.getName() == "elementsMNK") {
+      if (parseIntArrayAttr(parser, attr, elementsMNK, "elementsMNK").failed())
+        return {};
+    }
+    if (attr.getName() == "colMajor") {
+      if (parseUInt(parser, attr, colMajor, "colMajor").failed())
+        return {};
+    }
+    if (attr.getName() == "isATrans") {
+      if (parseBool(parser, attr, isATrans, "isATrans").failed())
+        return {};
+    }
+    if (attr.getName() == "isBTrans") {
+      if (parseBool(parser, attr, isBTrans, "isBTrans").failed())
+        return {};
+    }
+    if (attr.getName() == "elementsStride") {
+      if (parseIntArrayAttr(parser, attr, elementsStride, "elementsStride")
+              .failed())
+        return {};
+    }
+    if (attr.getName() == "CGALayout") {
+      ctaAttr = attr.getValue();
+      continue;
+    }
+  }
+
+  std::optional<CTAEncodingAttr> CTALayout =
+      parseCTAAttr(parser, ctaAttr, /*rank=*/warpsPerCTA.size());
+  if (!CTALayout.has_value())
+    return {};
+
+  return parser.getChecked<MACAMmaEncodingAttr>(
+      parser.getContext(), versionMajor, versionMinor, warpsPerCTA,
+      elementsMNK, colMajor, *CTALayout, isATrans, isBTrans, elementsStride);
+}
+
+void MACAMmaEncodingAttr::print(AsmPrinter &printer) const {
+  printer << "<{"
+          << "versionMajor = " << getVersionMajor()
+          << ", versionMinor = " << getVersionMinor()
+          << ", warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]"
+          << ", elementsMNK = [" << ArrayRef(getElementsMNK()) << "]"
+          << ", colMajor = " << getColMajor();
+
+  maybePrintCTALayout(getContext(), printer, getCTALayout(), /*rank=*/getRank());
+
+  printer << ", isATrans = " << getIsATrans()
+          << ", isBTrans = " << getIsBTrans()
+          << ", elementsStride = [" << ArrayRef(getElementsStride()) << "]"
+          << "}>";
+}
+
+LogicalResult MACAMmaEncodingAttr::verify(
+    function_ref<mlir::InFlightDiagnostic()> emitError, unsigned versionMajor,
+    unsigned versionMinor, llvm::ArrayRef<unsigned> warpsPerCTA,
+    llvm::ArrayRef<unsigned> elementsMNK, unsigned colMajor,
+    mlir::triton::gpu::CTAEncodingAttr, bool isATrans, bool isBTrans,
+    llvm::ArrayRef<unsigned> elementsStride) {
+  (void)versionMinor;
+  if (warpsPerCTA.size() != 2)
+    return emitError() << "warpsPerCTA must have rank 2";
+  if (elementsMNK.size() != 3)
+    return emitError() << "elementsMNK must have 3 entries";
+  if (elementsStride.size() != 2)
+    return emitError() << "elementsStride must have 2 entries";
+  if (versionMajor != 2)
+    return emitError() << "only versionMajor = 2 is supported";
+  if (colMajor > 1)
+    return emitError() << "colMajor must be 0 or 1";
+  if (isATrans || isBTrans)
+    return emitError() << "isATrans/isBTrans are not supported";
+  if (llvm::any_of(warpsPerCTA, [](unsigned v) { return v == 0; }))
+    return emitError() << "warpsPerCTA entries must be non-zero";
+  if (llvm::any_of(elementsMNK, [](unsigned v) { return v == 0; }))
+    return emitError() << "elementsMNK entries must be non-zero";
+  if (llvm::any_of(elementsStride, [](unsigned v) { return v == 0; }))
+    return emitError() << "elementsStride entries must be non-zero";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // WMMA encoding
 //===----------------------------------------------------------------------===//
+SmallVector<unsigned> MACAMmaEncodingAttr::getRepOrder() const {
+  return getMatrixOrder(getRank(), /*rowMajor=*/true);
+}
+
+SmallVector<unsigned>
+MACAMmaEncodingAttr::getRepOrderForOperand(int opIdx) const {
+  return getOrderForDotOperand(opIdx, getRank(), /*kContig=*/true);
+}
+
 bool AMDWmmaEncodingAttr::hasUnitTilesPerWarp() const {
   return llvm::all_of(getTilesPerWarp(), [](int x) { return x == 1; });
 }

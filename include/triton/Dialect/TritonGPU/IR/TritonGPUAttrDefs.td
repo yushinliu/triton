@@ -1067,6 +1067,44 @@ w2 w2 w3 w3
   let skipDefaultBuilders = 1;
 }
 
+def MACAMmaEncodingAttr : DistributedEncoding<"MACAMmaEncoding", "maca_mma_encoding", [MmaEncodingTrait]> {
+  let mnemonic = "maca_mma";
+
+  let description = [{
+An encoding for tensors that have been produced by MACA MMA instructions.
+
+This minimal variant models the accumulator layout used by ExtractTensorOp.
+It is characterized by:
+- `versionMajor` / `versionMinor`: MACA MMA layout version.
+- `warpsPerCTA`: warp arrangement in the CTA tile.
+- `elementsMNK`: per-instruction elements contributed along M/N/K.
+- `colMajor`: whether the accumulator is emitted in the column-major variant.
+- `isATrans` / `isBTrans`: operand transpose flags. They are parsed and
+  printed for compatibility, but current linearization only supports `false`.
+- `elementsStride`: operand stride metadata kept for compatibility.
+  }];
+
+  let parameters = (
+    ins
+    "unsigned":$versionMajor,
+    "unsigned":$versionMinor,
+    ArrayRefParameter<"unsigned">:$warpsPerCTA,
+    ArrayRefParameter<"unsigned">:$elementsMNK,
+    "unsigned":$colMajor,
+    "CTAEncodingAttr":$CTALayout,
+    "bool":$isATrans,
+    "bool":$isBTrans,
+    ArrayRefParameter<"unsigned">:$elementsStride
+  );
+
+  let extraClassDeclaration = extraDistributedDeclaration # [{
+    SmallVector<unsigned> getRepOrderForOperand(int opIdx) const;
+  }];
+
+  let genVerifyDecl = 1;
+  let hasCustomAssemblyFormat = 1;
+}
+
 def AMDWmmaEncodingAttr : DistributedEncoding<"AMDWmmaEncoding", "amd_wmma_encoding", [MmaEncodingTrait]> {
   let mnemonic = "amd_wmma";
 
