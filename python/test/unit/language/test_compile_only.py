@@ -159,6 +159,30 @@ def test_compile_only_dot_mxfp() -> None:
     assert k.asm["cubin"] != b""
 
 
+def test_compile_only_fp4_to_fp_scaled() -> None:
+
+    @triton.jit
+    def fp4_to_fp_scaled_kernel(input, scale, output, BLOCK_M: tl.constexpr, BLOCK_K_PACKED: tl.constexpr):
+        offs_m = tl.arange(0, BLOCK_M)[:, None]
+        offs_k = tl.arange(0, BLOCK_K_PACKED)[None, :]
+        x = tl.load(input + offs_m * BLOCK_K_PACKED + offs_k)
+        s = tl.load(scale + offs_m)
+        y = tl.fp4_to_fp_scaled(x, s, tl.float16, axis=1)
+        offs_out_k = tl.arange(0, BLOCK_K_PACKED * 2)[None, :]
+        tl.store(output + offs_m * (BLOCK_K_PACKED * 2) + offs_out_k, y)
+
+    k = triton.compile(
+        triton.compiler.ASTSource(
+            fn=fp4_to_fp_scaled_kernel, signature={
+                "input": "*i8", "scale": "*i8", "output": "*fp16", "BLOCK_M": "constexpr",
+                "BLOCK_K_PACKED": "constexpr"
+            }, constexprs={"BLOCK_M": 32, "BLOCK_K_PACKED": 16}), target=GPUTarget("cuda", 100, 32))
+    assert "tt.fp4_to_fp_scaled" in k.asm["ttir"]
+    assert "ttg.fp4_to_fp" in k.asm["ttgir"]
+    assert "arith.mulf" in k.asm["ttgir"]
+    assert k.asm["cubin"] != b""
+
+
 def test_signature_ordering():
     """
     Checks that ASTSource always uses the argument order from

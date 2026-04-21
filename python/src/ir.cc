@@ -1668,6 +1668,13 @@ void init_triton_ir(py::module &&m) {
                  rhs_scale.value_or(Value()), lhs_format, rhs_format, fast_math,
                  lhs_k_pack, rhs_k_pack);
            })
+      .def("create_fp4_to_fp_scaled",
+           [](TritonOpBuilder &self, mlir::Value &input, mlir::Value &scale,
+              Type elemType, int axis) -> mlir::Value {
+             return self.create<Fp4ToFpScaledOp>(
+                 cast<TypedValue<RankedTensorType>>(input),
+                 cast<TypedValue<RankedTensorType>>(scale), elemType, axis);
+           })
       .def("create_floor",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::FloorOp>(val);

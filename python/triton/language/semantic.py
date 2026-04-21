@@ -1661,6 +1661,40 @@ class TritonSemantic(Generic[TensorTy]):
             self.builder.create_dot_scaled(lhs.handle, lhs_scale_handle, lhs_format_enum, rhs.handle, rhs_scale_handle,
                                            rhs_format_enum, fast_math, lhs_k_pack, rhs_k_pack, acc_handle), ret_ty)
 
+    def fp4_to_fp_scaled(self, src: TensorTy, scale: TensorTy, elem_type: tl.dtype, axis: int) -> TensorTy:
+        assert src.type.is_block(), "src must be a tensor"
+        assert scale.type.is_block(), "scale must be a tensor"
+        assert src.dtype.is_int8() or src.dtype.is_uint8(), f"src must have int8 or uint8 dtype, got {src.dtype}"
+        assert scale.dtype.is_int8() or scale.dtype.is_uint8(), f"scale must have int8 or uint8 dtype, got {scale.dtype}"
+        assert elem_type in (tl.float16, tl.bfloat16), f"elem_type must be tl.float16 or tl.bfloat16, got {elem_type}"
+
+        rank = len(src.type.shape)
+        assert rank > 0, "src must have rank > 0"
+        assert len(scale.type.shape) == rank, (
+            f"scale rank must match src rank; got {len(scale.type.shape)} vs {rank}"
+        )
+        assert -rank <= axis < rank, f"axis {axis} must be in [-{rank}, {rank})"
+        if axis < 0:
+            axis += rank
+
+        shape = list(src.type.shape)
+        for d in range(rank):
+            if d == axis:
+                assert shape[d] % 16 == 0, f"src.shape[{axis}] must be divisible by 16, got {shape[d]}"
+                expected = shape[d] // 16
+                assert scale.type.shape[d] == expected, (
+                    f"scale.shape[{axis}] must be src.shape[{axis}] // 16 ({expected}), "
+                    f"got {scale.type.shape[d]}"
+                )
+            else:
+                assert scale.type.shape[d] == shape[d], (
+                    f"scale.shape[{d}] must match src.shape[{d}] ({shape[d]}), got {scale.type.shape[d]}"
+                )
+        shape[axis] *= 2
+        ret_ty = tl.block_type(elem_type, shape)
+        return self.tensor(
+            self.builder.create_fp4_to_fp_scaled(src.handle, scale.handle, elem_type.to_ir(self.builder), axis), ret_ty)
+
 # ===----------------------------------------------------------------------===//
 #                               Indexing
 # ===----------------------------------------------------------------------===//

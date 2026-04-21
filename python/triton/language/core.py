@@ -2102,6 +2102,30 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
                                 rhs_k_pack, out_dtype)
 
 
+@builtin
+def fp4_to_fp_scaled(src, scale, elem_type, axis, _semantic=None):
+    """
+    Upcast packed fp4 (e2m1) values and multiply them by fp8 e4m3 block scales
+    stored as int8 or uint8.
+
+    Each element of :code:`src` contains two fp4 values, with the first value in
+    the low 4 bits.  One :code:`scale` element applies to 16 packed input
+    elements along :code:`axis`, producing 32 output elements.  For example,
+    :code:`src` shape ``[32, 16]`` with :code:`axis=1` uses :code:`scale` shape
+    ``[32, 1]`` and returns shape ``[32, 32]``.
+
+    :param src: int8 or uint8 tensor containing packed fp4 values.
+    :param scale: int8 or uint8 tensor containing fp8 e4m3 bit patterns, one
+                  scale per 16 packed input elements.
+    :param elem_type: output dtype, either :code:`tl.float16` or
+                      :code:`tl.bfloat16`.
+    :param axis: axis along which fp4 values are packed.
+    """
+    elem_type = _unwrap_if_constexpr(elem_type)
+    axis = _unwrap_if_constexpr(axis)
+    return _semantic.fp4_to_fp_scaled(src, scale, elem_type, axis)
+
+
 # -----------------------
 # Non-Atomic Memory Operations
 # -----------------------

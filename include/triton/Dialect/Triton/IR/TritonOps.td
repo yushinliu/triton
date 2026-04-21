@@ -735,6 +735,43 @@ def TT_DotScaledOp : TT_Op<"dot_scaled", [Pure,
     let hasVerifier = 1;
 }
 
+def TT_Fp4ToFpScaledOp : TT_Op<"fp4_to_fp_scaled", [Pure]> {
+    let summary = "Upcast packed fp4 and multiply by fp8 scale";
+
+    let description = [{
+      Upcast fp4 (e2m1) values packed as i8 values and multiply each unpacked
+      fp4 value by a fp8 e4m3 scale stored as i8.  The final result is cast to
+      bf16 or fp16.
+
+      The lower 4 bits of each i8 input element represent the first fp4 value,
+      and the upper 4 bits represent the second fp4 value.  The `axis`
+      attribute specifies the axis along which fp4 values are packed.
+
+      One scale element applies to 16 packed i8 input elements along `axis`,
+      which corresponds to 32 unpacked result elements.
+    }];
+
+    let builders = [
+      OpBuilder<(ins "TypedValue<RankedTensorType>":$input,
+                     "TypedValue<RankedTensorType>":$scale,
+                     "Type":$elemType,
+                     "int32_t":$axis)>
+    ];
+
+    let arguments = (ins
+      RankedTensorOf<[I8]>:$input,
+      RankedTensorOf<[I8]>:$scale,
+      I32Attr:$axis
+    );
+    let results = (outs RankedTensorOf<[AnyTypeOf<[F16, BF16]>]>:$output);
+
+    let assemblyFormat = [{
+      $input `scale` $scale attr-dict `:` type($input) `,` type($scale) `->` type($output)
+    }];
+
+    let hasVerifier = 1;
+}
+
 //
 // Reduce Op
 //

@@ -394,6 +394,73 @@ LogicalResult DotScaledOp::verify() {
   return success();
 }
 
+//-- Fp4ToFpScaledOp --
+LogicalResult Fp4ToFpScaledOp::verify() {
+  auto inputTy = getInput().getType();
+  auto scaleTy = getScale().getType();
+  auto outputTy = getOutput().getType();
+  auto rank = inputTy.getRank();
+  int64_t axis = getAxis();
+
+  if (rank != outputTy.getRank())
+    return emitError() << "input rank " << rank << " != output rank "
+                       << outputTy.getRank();
+  if (rank != scaleTy.getRank())
+    return emitError() << "input rank " << rank << " != scale rank "
+                       << scaleTy.getRank();
+  if (axis < 0 || axis >= rank)
+    return emitError() << "axis " << axis << " out of range for rank "
+                       << rank;
+
+  auto inputShape = inputTy.getShape();
+  auto scaleShape = scaleTy.getShape();
+  auto outputShape = outputTy.getShape();
+  for (int i = 0; i < rank; ++i) {
+    if (i == axis) {
+      if (outputShape[i] != inputShape[i] * 2)
+        return emitError()
+               << "axis " << axis
+               << " dimension must be 2x input dimension (input="
+               << inputShape[i] << ", output=" << outputShape[i] << ")";
+      if (inputShape[i] % 16 != 0)
+        return emitError()
+               << "axis " << axis
+               << " input dimension must be divisible by 16, got "
+               << inputShape[i];
+      if (scaleShape[i] * 16 != inputShape[i])
+        return emitError()
+               << "axis " << axis
+               << " scale dimension must be input dimension / 16 (input="
+               << inputShape[i] << ", scale=" << scaleShape[i] << ")";
+      continue;
+    }
+    if (outputShape[i] != inputShape[i])
+      return emitError() << "output dimension " << i
+                         << " must match input dimension (input="
+                         << inputShape[i] << ", output=" << outputShape[i]
+                         << ")";
+    if (scaleShape[i] != inputShape[i])
+      return emitError() << "scale dimension " << i
+                         << " must match input dimension (input="
+                         << inputShape[i] << ", scale=" << scaleShape[i]
+                         << ")";
+  }
+
+  return success();
+}
+
+void Fp4ToFpScaledOp::build(OpBuilder &builder, OperationState &state,
+                            TypedValue<RankedTensorType> input,
+                            TypedValue<RankedTensorType> scale, Type elemType,
+                            int32_t axis) {
+  auto inputTy = input.getType();
+  auto shape = llvm::to_vector(inputTy.getShape());
+  assert(0 <= axis && axis < inputTy.getRank());
+  shape[axis] *= 2;
+  auto resultTy = RankedTensorType::get(shape, elemType);
+  build(builder, state, resultTy, input, scale, axis);
+}
+
 //-- MakeRangeOp --
 OpFoldResult MakeRangeOp::fold(FoldAdaptor adaptor) {
   // make_range(start, start + 1) -> constant(start)
