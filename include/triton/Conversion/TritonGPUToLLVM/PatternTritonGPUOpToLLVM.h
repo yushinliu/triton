@@ -3,6 +3,7 @@
 
 #include "TargetInfoBase.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "triton/Analysis/AxisInfo.h"
 
 using namespace mlir;
@@ -96,6 +97,8 @@ void populateFuncOpConversionPattern(LLVMTypeConverter &typeConverter,
                                      RewritePatternSet &patterns,
                                      const TargetInfoBase &targetInfo,
                                      PatternBenefit benefit);
+
+LogicalResult decomposeFp4ToFpScaledOps(ModuleOp module);
 
 void populatePrintOpToLLVMPattern(LLVMTypeConverter &typeConverter,
                                   RewritePatternSet &patterns,

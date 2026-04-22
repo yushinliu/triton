@@ -115,6 +115,9 @@ struct ConvertTritonAMDGPUToLLVM
       return signalPassFailure();
     }
 
+    if (failed(mlir::triton::decomposeFp4ToFpScaledOps(mod)))
+      return signalPassFailure();
+
     mlir::LowerToLLVMOptions option(context);
     option.overrideIndexBitwidth(32);
 

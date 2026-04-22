@@ -8,6 +8,7 @@ add_triton_library(TritonGPUToLLVM
     ControlFlowOpToLLVM.cpp
     ConvertLayoutOpToLLVM.cpp
     ElementwiseOpToLLVM.cpp
+    Fp4ToFpScaledOpToTritonGPU.cpp
     FuncOpToLLVM.cpp
     GatherOpToLLVM.cpp
     GlobalScratchMemoryAllocation.cpp

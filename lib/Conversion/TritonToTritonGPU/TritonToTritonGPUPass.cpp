@@ -279,85 +279,6 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
   }
 };
 
-struct TritonFp4ToFpScaledPattern
-    : public OpConversionPattern<triton::Fp4ToFpScaledOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::Fp4ToFpScaledOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    auto *ctx = rewriter.getContext();
-    auto axis = op.getAxis();
-    auto elemType = op.getType().getElementType();
-    auto f16 = rewriter.getF16Type();
-    auto f32 = rewriter.getF32Type();
-
-    auto input = cast<TypedValue<RankedTensorType>>(adaptor.getInput());
-    auto fp4F16 = triton::gpu::Fp4ToFpOp::create(rewriter, loc, input, f16,
-                                                 axis);
-    auto fp4F16Ty = fp4F16.getType();
-
-    auto scale = cast<TypedValue<RankedTensorType>>(adaptor.getScale());
-    auto scaleTy = scale.getType();
-    auto scaleFp8Ty = scaleTy.clone(Float8E4M3FNType::get(ctx));
-    auto scaleFp8 =
-        triton::BitcastOp::create(rewriter, loc, scaleFp8Ty, scale);
-    auto scaleF16Ty = scaleTy.clone(f16);
-    auto scaleF16 = cast<TypedValue<RankedTensorType>>(
-        triton::FpToFpOp::create(rewriter, loc, scaleF16Ty,
-                                 scaleFp8.getResult(), RoundingModeAttr())
-            .getResult());
-
-    auto rank = scaleTy.getRank();
-    auto typeConverter = getTypeConverter<TritonGPUTypeConverter>();
-    SmallVector<int64_t> expandedScaleShape(scaleTy.getShape());
-    expandedScaleShape.push_back(1);
-    auto blockedEnc = triton::gpu::getDefaultBlockedEncoding(
-        ctx, expandedScaleShape, typeConverter->getNumWarps(),
-        typeConverter->getThreadsPerWarp(), typeConverter->getNumCTAs());
-    auto sliceEnc = triton::gpu::SliceEncodingAttr::get(ctx, rank, blockedEnc);
-    auto sliceTy = scaleF16Ty.cloneWithEncoding(sliceEnc);
-    scaleF16 = triton::gpu::ConvertLayoutOp::create(rewriter, loc, sliceTy,
-                                                    scaleF16);
-
-    auto expandedScale =
-        triton::ExpandDimsOp::create(rewriter, loc, scaleF16, rank);
-
-    SmallVector<int64_t> broadcastShape(scaleTy.getShape());
-    broadcastShape.push_back(32);
-    auto broadcastScale = triton::BroadcastOp::create(
-        rewriter, loc, expandedScale.getType().clone(broadcastShape),
-        expandedScale);
-
-    auto transposeOrder = llvm::to_vector(llvm::seq<int32_t>(rank));
-    transposeOrder.insert(transposeOrder.begin() + axis + 1, rank);
-    auto transposedScale =
-        triton::TransOp::create(rewriter, loc, broadcastScale, transposeOrder);
-
-    SmallVector<int64_t> outputShape(scaleTy.getShape());
-    outputShape[axis] *= 32;
-    auto reshapedScale =
-        triton::ReshapeOp::create(rewriter, loc, outputShape, transposedScale);
-
-    auto scaleF16ForMul = triton::gpu::ConvertLayoutOp::create(
-        rewriter, loc, fp4F16Ty, reshapedScale);
-
-    auto fp4F32Ty = fp4F16Ty.clone(f32);
-    auto fp4F32 = arith::ExtFOp::create(
-        rewriter, loc, fp4F32Ty, fp4F16.getResult(),
-        arith::FastMathFlagsAttr());
-    auto scaleF32 = arith::ExtFOp::create(
-        rewriter, loc, fp4F32Ty, scaleF16ForMul.getResult(),
-        arith::FastMathFlagsAttr());
-    auto scaledF32 = arith::MulFOp::create(rewriter, loc, fp4F32, scaleF32);
-
-    auto outputTy = fp4F16Ty.clone(elemType);
-    rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, outputTy, scaledF32);
-    return success();
-  }
-};
-
 struct TritonCatPattern : public OpConversionPattern<triton::CatOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -662,7 +583,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       TritonExpandDimsPattern,
       TritonTransPattern,
       TritonDotPattern,
-      TritonFp4ToFpScaledPattern,
+      GenericOpPattern<triton::Fp4ToFpScaledOp>,
       TritonMapElementwisePattern,
       GatherScatterOpPattern<DescriptorGatherOp>,
       GatherScatterOpPattern<DescriptorScatterOp>,

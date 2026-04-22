@@ -37,12 +37,8 @@ tt.func @load_ops(%ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32} {
 tt.func @fp4_to_fp_scaled(%input: tensor<32x16xi8>, %scale: tensor<32x1xi8>) -> tensor<32x32xbf16> {
   // CHECK-LABEL: @fp4_to_fp_scaled
-  // CHECK: ttg.fp4_to_fp {{.*}} {axis = 1 : i32}
-  // CHECK: tt.bitcast
-  // CHECK: tt.fp_to_fp
-  // CHECK: tt.broadcast
-  // CHECK: arith.mulf
-  // CHECK: arith.truncf
+  // CHECK: %[[OUT:.*]] = tt.fp4_to_fp_scaled {{.*}} {axis = 1 : i32}
+  // CHECK-NEXT: tt.return %[[OUT]]
   %0 = tt.fp4_to_fp_scaled %input scale %scale {axis = 1 : i32} : tensor<32x16xi8>, tensor<32x1xi8> -> tensor<32x32xbf16>
   tt.return %0 : tensor<32x32xbf16>
 }

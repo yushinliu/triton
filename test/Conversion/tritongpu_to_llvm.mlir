@@ -2648,6 +2648,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+#fp4_blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#scale_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#fp_blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: fp4_to_fp_scaled_to_llvm
+  tt.func public @fp4_to_fp_scaled_to_llvm(%input : tensor<32x16xi8, #fp4_blocked>, %scale : tensor<32x1xi8, #scale_blocked>, %out : tensor<32x32x!tt.ptr<f16>, #fp_blocked>) {
+    // CHECK-NOT: tt.fp4_to_fp_scaled
+    // CHECK: cvt.rn.f16x2.e4m3x2
+    // CHECK: llvm.fmul
+    %0 = tt.fp4_to_fp_scaled %input scale %scale {axis = 1 : i32} : tensor<32x16xi8, #fp4_blocked>, tensor<32x1xi8, #scale_blocked> -> tensor<32x32xf16, #fp_blocked>
+    tt.store %out, %0 : tensor<32x32x!tt.ptr<f16>, #fp_blocked>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:75", "ttg.threads-per-warp" = 32 : i32} {

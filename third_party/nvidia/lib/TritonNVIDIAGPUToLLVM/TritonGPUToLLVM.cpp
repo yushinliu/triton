@@ -82,6 +82,9 @@ struct ConvertTritonGPUToLLVM
     ModuleOp mod = getOperation();
     TargetInfo targetInfo(computeCapability, ptxVersion);
 
+    if (failed(mlir::triton::decomposeFp4ToFpScaledOps(mod)))
+      return signalPassFailure();
+
     // Allocate shared memory and set barrier
     ModuleAllocation allocation(
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
