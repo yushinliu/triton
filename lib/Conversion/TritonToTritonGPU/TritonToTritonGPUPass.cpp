@@ -279,6 +279,39 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
   }
 };
 
+struct TritonFp4ToFpScaledPattern
+    : public OpConversionPattern<triton::Fp4ToFpScaledOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::Fp4ToFpScaledOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto input = cast<TypedValue<RankedTensorType>>(adaptor.getInput());
+    auto inputTy = input.getType();
+    auto inputEnc = inputTy.getEncoding();
+    if (!inputEnc)
+      return failure();
+
+    auto outputTy = op.getType();
+    Attribute outputEnc;
+    auto inferLayoutInterface =
+        inputEnc.getDialect()
+            .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+    assert(inferLayoutInterface);
+    if (failed(inferLayoutInterface->inferFp4ToFpOpEncoding(
+            outputTy.getShape(), op.getAxis(), inputEnc, outputEnc,
+            /*fwdInference=*/true, op.getLoc())))
+      return failure();
+
+    auto newOutputTy = outputTy.cloneWithEncoding(outputEnc);
+    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::Fp4ToFpScaledOp>(
+                      op, newOutputTy, adaptor.getInput(), adaptor.getScale(),
+                      op.getAxisAttr()),
+                  adaptor.getAttributes());
+    return success();
+  }
+};
+
 struct TritonCatPattern : public OpConversionPattern<triton::CatOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -583,7 +616,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       TritonExpandDimsPattern,
       TritonTransPattern,
       TritonDotPattern,
-      GenericOpPattern<triton::Fp4ToFpScaledOp>,
+      TritonFp4ToFpScaledPattern,
       TritonMapElementwisePattern,
       GatherScatterOpPattern<DescriptorGatherOp>,
       GatherScatterOpPattern<DescriptorScatterOp>,
