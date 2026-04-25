@@ -8,6 +8,7 @@ add_triton_library(TritonGPUTransforms
   HoistTMEMAlloc.cpp
   ReduceDataDuplication.cpp
   OptimizeAccumulatorInit.cpp
+  OptimizeConstancyLoad.cpp
   OptimizeDotOperands.cpp
   OptimizeThreadLocality.cpp
   Pipeliner/AssignLatencies.cpp

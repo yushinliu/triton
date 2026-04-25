@@ -255,6 +255,7 @@ class CUDABackend(BaseBackend):
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
+        passes.ttgpuir.add_optimize_constancy_load(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
         nvidia.passes.ttnvgpuir.add_plan_cta(pm)

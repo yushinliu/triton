@@ -52,6 +52,21 @@ getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                         triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
                         SmallVector<int64_t> &shapePerCTA);
 
+// Return the number of contiguous groups between repeated values on `dim`.
+// For example, offsets `tl.arange(0, N) // 2` have constancy 2 and an
+// inter-constancy contiguity of N / 2 on the arange dimension.
+unsigned getContiguityInterConstancyGroup(
+    Value value, unsigned dim,
+    triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
+
+// Calculate an enlarged sizePerThread for loads whose pointer tensor has
+// constancy on the fastest memory dimension. This lets lowering emit one load
+// per repeated address and reuse the value for the other registers.
+unsigned getNumElementsPerThreadForConstancyLoad(
+    triton::LoadOp loadOp, ArrayRef<unsigned> order,
+    triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
+    SmallVector<int64_t> &shapePerCTA);
+
 // Returns whether the op is a "view op", i.e. doesn't move any data
 bool isView(Operation *op);
 

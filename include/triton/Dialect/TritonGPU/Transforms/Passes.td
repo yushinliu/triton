@@ -246,6 +246,20 @@ def TritonGPUCoalesce: Pass<"tritongpu-coalesce", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
+def TritonGPUOptimizeConstancyLoad: Pass<"tritongpu-optimize-constancy-load", "mlir::ModuleOp"> {
+  let summary = "optimize loads with repeated addresses";
+
+  let description = [{
+    The pass finds `tt.load` operations whose pointer tensor repeats addresses
+    along the fastest memory dimension, for example `offsets // GROUP`, and
+    rewrites only those loads to use a blocked layout with a larger
+    `sizePerThread`. This makes the repeated addresses local to a thread so the
+    target-specific load lowering can issue one load and reuse the value.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
 
 def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions", "mlir::ModuleOp"> {
   let summary = "remove superfluous layout conversions";

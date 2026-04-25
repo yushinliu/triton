@@ -1,6 +1,7 @@
 #include "triton/Analysis/Utility.h"
 
 #include <fstream>
+#include <optional>
 
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -139,6 +140,166 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                         << ", contig: " << valInfo.getContiguity(order[0])
                         << ", alignment: " << alignment);
   return currPerThread;
+}
+
+static unsigned floorPowerOfTwo(unsigned value) {
+  unsigned result = 1;
+  while (result <= value / 2)
+    result *= 2;
+  return result;
+}
+
+static std::optional<unsigned>
+getConstantUInt(Value value, ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+  APInt intValue;
+  if (matchPattern(value, m_ConstantInt(&intValue))) {
+    int64_t signedValue = intValue.getSExtValue();
+    if (signedValue > 0)
+      return static_cast<unsigned>(signedValue);
+    return std::nullopt;
+  }
+
+  DenseElementsAttr constAttr;
+  if (matchPattern(value, m_Constant(&constAttr)) && constAttr.isSplat() &&
+      isa<IntegerType>(constAttr.getElementType())) {
+    int64_t signedValue = constAttr.getSplatValue<APInt>().getSExtValue();
+    if (signedValue > 0)
+      return static_cast<unsigned>(signedValue);
+    return std::nullopt;
+  }
+
+  if (auto *axisInfo = axisInfoAnalysis.getAxisInfo(value)) {
+    if (auto constant = axisInfo->getConstantValue()) {
+      if (*constant > 0)
+        return static_cast<unsigned>(*constant);
+    }
+  }
+  return std::nullopt;
+}
+
+static unsigned getAxisConstancy(Value value, unsigned dim,
+                                 unsigned fallbackShape,
+                                 ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+  auto tensorTy = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensorTy || dim >= tensorTy.getRank())
+    return fallbackShape;
+  auto *axisInfo = axisInfoAnalysis.getAxisInfo(value);
+  if (!axisInfo || dim >= axisInfo->getRank())
+    return 1;
+  return axisInfo->getConstancy(dim);
+}
+
+unsigned getContiguityInterConstancyGroup(
+    Value value, unsigned dim, ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    Block *block = blockArg.getOwner();
+    if (auto forOp = dyn_cast<scf::ForOp>(block->getParentOp())) {
+      unsigned argIndex = blockArg.getArgNumber();
+      if (argIndex >= forOp.getNumInductionVars()) {
+        argIndex -= forOp.getNumInductionVars();
+        if (argIndex < forOp.getInitArgs().size())
+          return getContiguityInterConstancyGroup(forOp.getInitArgs()[argIndex],
+                                                  dim, axisInfoAnalysis);
+      }
+    }
+    return 1;
+  }
+
+  Operation *op = value.getDefiningOp();
+  if (!op)
+    return 1;
+
+  if (auto broadcastOp = dyn_cast<triton::BroadcastOp>(op)) {
+    auto srcTy = dyn_cast<RankedTensorType>(broadcastOp.getSrc().getType());
+    if (!srcTy || dim >= srcTy.getRank())
+      return 1;
+    auto srcOrder = triton::gpu::getOrder(srcTy);
+    if (srcTy.getShape()[dim] == 1 || srcOrder.empty() || srcOrder[0] != dim)
+      return 1;
+    return getContiguityInterConstancyGroup(broadcastOp.getSrc(), dim,
+                                            axisInfoAnalysis);
+  }
+
+  if (isa<triton::gpu::ConvertLayoutOp, triton::gpu::LocalAllocOp,
+          triton::gpu::LocalLoadOp>(op))
+    return 1;
+
+  if (auto addPtr = dyn_cast<triton::AddPtrOp>(op)) {
+    auto resultTy = dyn_cast<RankedTensorType>(addPtr.getType());
+    if (!resultTy || dim >= resultTy.getRank())
+      return 1;
+    unsigned shape = resultTy.getShape()[dim];
+
+    unsigned ptrContiguity =
+        getContiguityInterConstancyGroup(addPtr.getPtr(), dim,
+                                         axisInfoAnalysis);
+    unsigned ptrConstancy =
+        getAxisConstancy(addPtr.getPtr(), dim, shape, axisInfoAnalysis);
+
+    unsigned offsetContiguity =
+        getContiguityInterConstancyGroup(addPtr.getOffset(), dim,
+                                         axisInfoAnalysis);
+    unsigned offsetConstancy =
+        getAxisConstancy(addPtr.getOffset(), dim, shape, axisInfoAnalysis);
+
+    if (ptrConstancy >= shape && offsetContiguity > 1)
+      return offsetContiguity;
+    if (offsetConstancy >= shape && ptrContiguity > 1)
+      return ptrContiguity;
+    return 1;
+  }
+
+  auto getDivisor = [&](Value rhs) -> std::optional<unsigned> {
+    return getConstantUInt(rhs, axisInfoAnalysis);
+  };
+  auto getDividedContiguity = [&](Value lhs,
+                                  unsigned divisor) -> unsigned {
+    auto *lhsInfo = axisInfoAnalysis.getAxisInfo(lhs);
+    if (!lhsInfo || dim >= lhsInfo->getRank())
+      return 1;
+    return std::max<unsigned>(lhsInfo->getContiguity(dim) / divisor, 1);
+  };
+
+  if (auto divOp = dyn_cast<arith::DivSIOp>(op)) {
+    if (auto divisor = getDivisor(divOp.getRhs()))
+      return getDividedContiguity(divOp.getLhs(), *divisor);
+    return 1;
+  }
+  if (auto divOp = dyn_cast<arith::DivUIOp>(op)) {
+    if (auto divisor = getDivisor(divOp.getRhs()))
+      return getDividedContiguity(divOp.getLhs(), *divisor);
+    return 1;
+  }
+
+  return 1;
+}
+
+unsigned getNumElementsPerThreadForConstancyLoad(
+    triton::LoadOp loadOp, ArrayRef<unsigned> order,
+    ModuleAxisInfoAnalysis &axisInfoAnalysis,
+    SmallVector<int64_t> &shapePerCTA) {
+  Value ptr = loadOp.getPtr();
+  auto ptrTy = dyn_cast<RankedTensorType>(ptr.getType());
+  if (!ptrTy || order.empty())
+    return 1;
+
+  unsigned dim = order[0];
+  auto *axisInfo = axisInfoAnalysis.getAxisInfo(ptr);
+  if (!axisInfo || dim >= axisInfo->getRank() || dim >= shapePerCTA.size())
+    return 1;
+
+  unsigned constancy = axisInfo->getConstancy(dim);
+  if (constancy <= 1 || axisInfo->getContiguity(dim) != 1)
+    return 1;
+
+  unsigned elemBits = getElementBitWidth(ptrTy);
+  unsigned interConstancyContiguity =
+      getContiguityInterConstancyGroup(ptr, dim, axisInfoAnalysis);
+  unsigned loadPerThread =
+      std::min<unsigned>(128 / elemBits, interConstancyContiguity);
+  unsigned sizePerThread =
+      std::min<unsigned>(loadPerThread * constancy, shapePerCTA[dim]);
+  return floorPowerOfTwo(sizePerThread);
 }
 
 bool isView(Operation *op) {

@@ -22,6 +22,7 @@
 #include "triton/Tools/LayoutUtils.h"
 
 #include <cassert>
+#include <cstdlib>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -158,6 +159,59 @@ struct LoadStoreConversionBase {
     return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
   }
 
+  unsigned getThreadConstRepeatTimes(Value ptr) const {
+    if (getenv("TRITON_DISABLE_CONSTANCY_LOAD_LAYOUT_OPT"))
+      return 1;
+    auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+    if (!tensorTy)
+      return 1;
+    auto *axisInfo = axisAnalysisPass.getAxisInfo(ptr);
+    if (!axisInfo)
+      return 1;
+
+    auto order = triton::gpu::getOrder(tensorTy);
+    if (order.empty())
+      return 1;
+    unsigned dim = order[0];
+    if (dim >= axisInfo->getRank())
+      return 1;
+    auto sizePerThread = triton::gpu::getElemsPerThread(tensorTy)[dim];
+    unsigned constancy = axisInfo->getConstancy(dim);
+    if (constancy <= 1 || sizePerThread <= 1)
+      return 1;
+    if (constancy > sizePerThread && constancy % sizePerThread == 0)
+      return sizePerThread;
+    if (sizePerThread % constancy != 0)
+      return 1;
+    return constancy;
+  }
+
+  unsigned getLoadVectorSize(Value ptr) const {
+    auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+    if (!tensorTy)
+      return 1;
+
+    unsigned contiguity = getContiguity(ptr);
+    unsigned constRepeatPerThread = getThreadConstRepeatTimes(ptr);
+    if (contiguity == 1 && constRepeatPerThread > 1) {
+      auto order = triton::gpu::getOrder(tensorTy);
+      if (order.empty())
+        return getVectorSize(ptr);
+      unsigned dim = order[0];
+      unsigned sizePerThread = triton::gpu::getElemsPerThread(tensorTy)[dim];
+      unsigned loadPerThread =
+          std::max<unsigned>(sizePerThread / constRepeatPerThread, 1);
+      contiguity = std::min<unsigned>(
+          getContiguityInterConstancyGroup(ptr, dim, axisAnalysisPass),
+          loadPerThread);
+    }
+
+    auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
+    LDBG("getLoadVectorSize contiguity = "
+         << contiguity << " pointeeBitWidth = " << pointeeBitWidth);
+    return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  }
+
   unsigned getMaskAlignment(Value mask) const {
     return axisAnalysisPass.getMaskAlignment(mask);
   }
@@ -202,14 +256,29 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
     // Determine the vectorization size
     Type valueElemTy =
         typeConverter->convertType(getElementTypeOrSelf(op.getType()));
-    unsigned vec = getVectorSize(ptr);
+    unsigned constRepeatPerThread = other ? 1 : getThreadConstRepeatTimes(ptr);
+    unsigned vec =
+        constRepeatPerThread > 1 ? getLoadVectorSize(ptr) : getVectorSize(ptr);
     unsigned numElems = getTotalElemsPerThread(ptr.getType());
     unsigned vecOrig = vec;
+    unsigned maskAlign = 0;
     if (llMask) {
+      maskAlign = getMaskAlignment(mask);
       LLVM_DEBUG(DBGS() << "vec = " << vec
-                        << " mask_alignment = " << getMaskAlignment(mask));
-      vec = std::min<size_t>(vec, getMaskAlignment(mask));
+                        << " mask_alignment = " << maskAlign);
+      if (constRepeatPerThread > 1 && maskAlign < constRepeatPerThread) {
+        constRepeatPerThread = 1;
+        vec = getVectorSize(ptr);
+      }
+      vec = std::min<size_t>(vec, maskAlign);
       LLVM_DEBUG(llvm::dbgs() << " vec = " << vec << '\n');
+    }
+    if (constRepeatPerThread > 1 &&
+        numElems % (vec * constRepeatPerThread) != 0) {
+      constRepeatPerThread = 1;
+      vec = getVectorSize(ptr);
+      if (llMask)
+        vec = std::min<size_t>(vec, maskAlign);
     }
 
     if (vec == 1 && numElems > 1) {
@@ -260,12 +329,13 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                               << " valueElemNBits = " << valueElemNBits << " "
                               << op.getType());
     SmallVector<Value> loadedVals;
-    for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
+    unsigned stride = vec * constRepeatPerThread;
+    for (size_t vecStart = 0; vecStart < numElems; vecStart += stride) {
       if (auto canonicalVecStart = getCanonicalIndex(vecStart, regMask);
           vecStart != canonicalVecStart) {
         // For redundant registers, refer back to the canonical load
-        for (auto iVec = 0; iVec < vec; ++iVec) {
-          loadedVals.push_back(loadedVals[canonicalVecStart + iVec]);
+        for (auto i = 0; i < stride; ++i) {
+          loadedVals.push_back(loadedVals[canonicalVecStart + i]);
         }
         continue;
       }
@@ -389,7 +459,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
         Value vecIdx = createIndexAttrConstant(
             rewriter, loc, typeConverter->getIndexType(), ii % tmp);
         Value loaded = b.extract_element(valueElemTy, rets[ii / tmp], vecIdx);
-        loadedVals.push_back(loaded);
+        for (unsigned repeat = 0; repeat < constRepeatPerThread; ++repeat)
+          loadedVals.push_back(loaded);
       }
     } // end vec
 
